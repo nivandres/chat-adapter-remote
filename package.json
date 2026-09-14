@@ -1,0 +1,77 @@
+{
+  "name": "chat-adapter-remote",
+  "version": "0.1.0",
+  "description": "Run any Chat SDK adapter in a separate process or deployment from your bot logic, bridged over signed HTTP JSON-RPC",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nivandres/chat-adapter-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nivandres/chat-adapter-remote/issues"
+  },
+  "homepage": "https://github.com/nivandres/chat-adapter-remote#readme",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./host": {
+      "types": "./dist/host.d.ts",
+      "import": "./dist/host.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "typecheck:examples": "tsc --noEmit --project examples/tsconfig.json",
+    "lint": "oxlint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "chat": "^4.40.0"
+  },
+  "dependencies": {
+    "@chat-adapter/shared": "^4.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@chat-adapter/state-memory": "^4.0.0",
+    "@chat-adapter/tests": "^4.0.0",
+    "@types/bun": "^1.4.2",
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@vitest/coverage-v8": "^4.0.0",
+    "baileys": "^7.0.0-rc14",
+    "chat": "^4.0.0",
+    "chat-adapter-baileys": "^2.1.0",
+    "oxlint": "^1.61.0",
+    "prettier": "^3.8.3",
+    "qrcode-terminal": "^0.12.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "chat-sdk",
+    "chat-adapter",
+    "remote",
+    "rpc",
+    "proxy"
+  ],
+  "license": "MIT"
+}
