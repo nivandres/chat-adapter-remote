@@ -71,13 +71,17 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         );
       }
       const envelope = JsonRpcResponseSchema.parse(parsed);
+      // Read the error before matching the id: a request rejected before it
+      // was parsed (bad signature, oversized body, malformed JSON) answers
+      // with `id: null` per JSON-RPC, and matching first would report every
+      // one of those as an id mismatch instead of the actual reason.
+      if (isErrorResponse(envelope)) throw deserializeError(envelope.error);
       if (envelope.id !== id) {
         throw new RemoteAdapterRpcError(
           RpcErrorCode.INTERNAL_ERROR,
           "chat-adapter-remote: response id did not match request",
         );
       }
-      if (isErrorResponse(envelope)) throw deserializeError(envelope.error);
       return decode(envelope.result);
     },
     notify(method, params) {

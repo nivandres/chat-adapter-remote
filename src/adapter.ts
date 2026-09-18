@@ -66,6 +66,15 @@ type InboundEvent = Exclude<
   { method: "log" }
 >;
 
+/**
+ * A missing secret would mean accepting unsigned calls, and a missing url
+ * would mean dropping every message; both are deployment mistakes worth
+ * failing on at startup rather than on the first request.
+ */
+function requireOption(value: string | undefined, option: string): void {
+  if (!value) throw new Error(`chat-adapter-remote: "${option}" is required`);
+}
+
 /** Either the host is consuming, or it already finished without reading. */
 type StreamStart =
   { streamId: string } | { done: true; result: RawMessage<unknown> | null };
@@ -101,6 +110,8 @@ export class RemoteAdapter<
   private readonly maxCachedThreads: number;
 
   constructor(private readonly config: RemoteAdapterConfig) {
+    requireOption(config.url, "url");
+    requireOption(config.secret, "secret");
     this.name = config.name ?? "remote";
     this.userName = config.userName ?? this.name;
     this.logger =
@@ -537,6 +548,22 @@ export class RemoteAdapter<
     request: Request,
     options?: WebhookOptions,
   ): Promise<Response> {
+    // Nothing here may throw past this point; the caller is a webhook route.
+    try {
+      return await this.receive(request, options);
+    } catch (error) {
+      this.report(error, "handleWebhook");
+      return Response.json(
+        { jsonrpc: "2.0", id: null, error: serializeError(error) },
+        { status: 500 },
+      );
+    }
+  }
+
+  private async receive(
+    request: Request,
+    options?: WebhookOptions,
+  ): Promise<Response> {
     const verified = await verifyRequest(request, {
       secret: this.config.secret,
       timestampToleranceMs: this.config.timestampToleranceMs,
@@ -594,8 +621,12 @@ export class RemoteAdapter<
     }
 
     try {
-      this.deliver(chat, call.data, options);
-      return Response.json({ jsonrpc: "2.0", id: call.data.id, result: null });
+      const answer = await this.deliver(chat, call.data, options);
+      return Response.json({
+        jsonrpc: "2.0",
+        id: call.data.id,
+        result: answer ?? null,
+      });
     } catch (error) {
       const wireError = serializeError(error);
       return Response.json(
@@ -608,8 +639,14 @@ export class RemoteAdapter<
   /** Handlers run under the caller's `waitUntil`, so work is started rather than awaited; an unhandled rejection would end the process. */
   private detach(work: unknown, method: string): void {
     void Promise.resolve(work).catch((error: unknown) =>
-      this.logger.error(`inbound ${method} failed`, { error }),
+      this.report(error, method),
     );
+  }
+
+  /** The consumer usually runs where no debugger can be attached, so failures have to be routable. */
+  private report(error: unknown, method: string): void {
+    this.logger.error(`inbound ${method} failed`, { error });
+    this.config.onError?.(error, { method });
   }
 
   /** Rebuilds what the host had to strip: dates, buffers, messages, the emoji singleton, and this adapter. */
@@ -630,7 +667,7 @@ export class RemoteAdapter<
     chat: ChatInstance,
     call: InboundEvent,
     options?: WebhookOptions,
-  ): void {
+  ): Promise<unknown> | void {
     switch (call.method) {
       case "processMessage": {
         const [threadId, wire, facts] = call.params;
@@ -684,6 +721,37 @@ export class RemoteAdapter<
       case "abortTurn":
         this.detach(chat.abortTurn(call.params[0]), call.method);
         return;
+      case "processModalClose":
+        this.detach(
+          chat.processModalClose(
+            this.event(call.params[0]),
+            call.params[1] ?? undefined,
+            options,
+          ),
+          call.method,
+        );
+        return;
+      case "processAgentSessionStopped":
+      case "processAgentSessionTitleChanged":
+      case "processAppHomeOpened":
+      case "processAppContextChanged":
+      case "processAssistantThreadStarted":
+      case "processAssistantContextChanged":
+      case "processMemberJoinedChannel":
+        this.detach(
+          chat[call.method](this.event(call.params[0]), options),
+          call.method,
+        );
+        return;
+      // Awaited, not detached: the host is relaying the answer to the platform.
+      case "processModalSubmit":
+        return chat.processModalSubmit(
+          this.event(call.params[0]),
+          call.params[1] ?? undefined,
+          options,
+        );
+      case "processOptionsLoad":
+        return chat.processOptionsLoad(this.event(call.params[0]), options);
     }
   }
 }

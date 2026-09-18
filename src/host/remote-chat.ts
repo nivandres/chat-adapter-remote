@@ -40,16 +40,29 @@ export interface RemoteChatOptions {
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
   maxConcurrentForwards?: number;
+  /** Messages allowed to queue behind those. Default 1000; past it, forwarding fails rather than growing. */
+  maxQueuedForwards?: number;
 }
 
-/** Caps concurrent tasks so a burst cannot open one request per message. */
-function createLimiter(limit: number) {
+/**
+ * Caps concurrent tasks so a burst cannot open one request per message, and
+ * caps the queue behind them so a history sync cannot park an unbounded number
+ * of pending promises. Arrivals queue whenever anyone is already waiting, so a
+ * latecomer cannot overtake the backlog.
+ */
+function createLimiter(limit: number, maxQueued: number) {
   const waiting: Array<() => void> = [];
   let active = 0;
 
   return async function run<T>(task: () => Promise<T>): Promise<T> {
-    if (active >= limit)
+    if (active >= limit || waiting.length > 0) {
+      if (waiting.length >= maxQueued) {
+        throw new Error(
+          `chat-adapter-remote: ${maxQueued} messages already waiting to be forwarded`,
+        );
+      }
       await new Promise<void>((resolve) => waiting.push(resolve));
+    }
     active++;
     try {
       return await task();
@@ -74,7 +87,10 @@ class RemoteChat {
   constructor(private readonly options: RemoteChatOptions) {
     this.logger =
       options.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
-    this.limit = createLimiter(options.maxConcurrentForwards ?? 8);
+    this.limit = createLimiter(
+      options.maxConcurrentForwards ?? 8,
+      options.maxQueuedForwards ?? 1000,
+    );
     this.rpc = createRpcClient({
       url: options.consumerUrl,
       secret: options.secret,
@@ -126,14 +142,41 @@ class RemoteChat {
   private async forwardEvent(
     method: string,
     event: EventPayload,
+    contextId?: string,
   ): Promise<void> {
     const threadId = event.threadId as string | undefined;
     try {
       const wire = await this.serializeEvent(event);
-      await this.forward(method, [wire], threadId);
+      const params = contextId === undefined ? [wire] : [wire, contextId];
+      await this.forward(method, params, threadId);
     } catch (error) {
       this.logger.error(`failed to serialize ${method}`, { threadId, error });
       this.options.onError?.(error, { phase: "forward", threadId });
+    }
+  }
+
+  /**
+   * Unlike the fire-and-forget events, the platform is waiting on these, so
+   * the consumer's answer is returned. A failure resolves to undefined, which
+   * is what Chat treats as "no response" for both of them.
+   */
+  private async askEvent(
+    method: string,
+    event: EventPayload,
+    contextId?: string,
+  ): Promise<unknown> {
+    const threadId = event.threadId as string | undefined;
+    try {
+      const wire = await this.serializeEvent(event);
+      const params = contextId === undefined ? [wire] : [wire, contextId];
+      return await this.limit(() => this.rpc.request(method, params));
+    } catch (error) {
+      this.logger.error(`failed to deliver ${method} to consumer`, {
+        threadId,
+        error,
+      });
+      this.options.onError?.(error, { phase: "forward", threadId });
+      return undefined;
     }
   }
 
@@ -191,6 +234,49 @@ class RemoteChat {
 
   processSlashCommand(event: EventPayload): void {
     void this.forwardEvent("processSlashCommand", event);
+  }
+
+  processModalClose(event: EventPayload, contextId?: string): void {
+    void this.forwardEvent("processModalClose", event, contextId);
+  }
+
+  processAgentSessionStopped(event: EventPayload): void {
+    void this.forwardEvent("processAgentSessionStopped", event);
+  }
+
+  processAgentSessionTitleChanged(event: EventPayload): void {
+    void this.forwardEvent("processAgentSessionTitleChanged", event);
+  }
+
+  processAppHomeOpened(event: EventPayload): void {
+    void this.forwardEvent("processAppHomeOpened", event);
+  }
+
+  processAppContextChanged(event: EventPayload): void {
+    void this.forwardEvent("processAppContextChanged", event);
+  }
+
+  processAssistantThreadStarted(event: EventPayload): void {
+    void this.forwardEvent("processAssistantThreadStarted", event);
+  }
+
+  processAssistantContextChanged(event: EventPayload): void {
+    void this.forwardEvent("processAssistantContextChanged", event);
+  }
+
+  processMemberJoinedChannel(event: EventPayload): void {
+    void this.forwardEvent("processMemberJoinedChannel", event);
+  }
+
+  processModalSubmit(
+    event: EventPayload,
+    contextId?: string,
+  ): Promise<unknown> {
+    return this.askEvent("processModalSubmit", event, contextId);
+  }
+
+  processOptionsLoad(event: EventPayload): Promise<unknown> {
+    return this.askEvent("processOptionsLoad", event);
   }
 
   abortTurn(threadId: string): Promise<void> {

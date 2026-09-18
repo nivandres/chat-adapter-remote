@@ -8,6 +8,16 @@ export type FetchLike = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+export interface RemoteAdapterErrorContext {
+  /** The inbound method that failed. */
+  method: string;
+}
+
+export type RemoteAdapterErrorHandler = (
+  error: unknown,
+  context: RemoteAdapterErrorContext,
+) => void;
+
 export interface RemoteAdapterConfig {
   /** The AdapterHost dispatch endpoint. */
   url: string;
@@ -22,6 +32,8 @@ export interface RemoteAdapterConfig {
   timestampToleranceMs?: number;
   /** Rejects inbound bodies larger than this. Default 5MB. */
   maxBodyBytes?: number;
+  /** Receives failures that would otherwise only reach the logger. */
+  onError?: RemoteAdapterErrorHandler;
   /** Rejects an inbound signature that was already accepted. Defaults to a per-process store; supply your own to share one across instances. */
   replayGuard?: ReplayGuard;
   /** Thread facts kept from inbound messages, oldest evicted first. Default 1000. */

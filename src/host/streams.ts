@@ -62,16 +62,20 @@ interface PendingStream {
 export interface StreamRegistryOptions {
   /** Streams idle for longer than this are dropped. Default 5 minutes. */
   ttlMs?: number;
+  /** How long the adapter may take to either answer or start reading. Default 10 seconds. */
+  startTimeoutMs?: number;
 }
 
 /** Rebuilds the AsyncIterable `Adapter.stream` expects from the consumer's open/push/end calls. */
 export class StreamRegistry {
   private readonly streams = new Map<string, PendingStream>();
   private readonly ttlMs: number;
+  private readonly startTimeoutMs: number;
   private sequence = 0;
 
   constructor(options: StreamRegistryOptions = {}) {
     this.ttlMs = options.ttlMs ?? 300_000;
+    this.startTimeoutMs = options.startTimeoutMs ?? 10_000;
   }
 
   async open(run: StreamRun): Promise<StreamStart> {
@@ -83,13 +87,32 @@ export class StreamRegistry {
     // end() observes this; the no-op keeps a mid-stream failure from being unhandled meanwhile.
     result.catch(() => {});
 
+    // An adapter that neither answers nor starts reading would otherwise hold
+    // the request open with no id, leaving nothing for sweep() to reclaim.
+    let expire: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      expire = setTimeout(() => resolve("timeout"), this.startTimeoutMs);
+    });
+
     const settled = await Promise.race([
       result.then(
         (value) => ({ value }),
         (error: unknown) => ({ error }),
       ),
       started.then(() => undefined),
+      timedOut,
     ]);
+    clearTimeout(expire);
+
+    if (settled === "timeout") {
+      // Not awaited: an adapter that hung here may never settle, which is the
+      // very case being handled. The catch above keeps it from going unhandled.
+      queue.close();
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.STREAM_NOT_FOUND,
+        `chat-adapter-remote: the adapter did not start streaming within ${this.startTimeoutMs}ms`,
+      );
+    }
     if (settled) {
       if ("error" in settled) throw settled.error;
       return { done: true, result: settled.value };

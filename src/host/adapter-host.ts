@@ -50,10 +50,19 @@ export interface ServeAdapterOptions extends DispatchOptions {
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
   maxConcurrentForwards?: number;
+  /** Messages allowed to queue behind those. Default 1000. */
+  maxQueuedForwards?: number;
   /** Initialize during construction. Default true; set false to control startup with start(). */
   autoStart?: boolean;
   /** Streams abandoned by the consumer are dropped after this long. Default 5 minutes. */
   streamTtlMs?: number;
+  /** How long the adapter may take to start streaming. Default 10 seconds. */
+  streamStartTimeoutMs?: number;
+}
+
+/** Both are deployment mistakes: failing here beats failing on the first request. */
+function requireOption(value: string | undefined, option: string): void {
+  if (!value) throw new Error(`chat-adapter-remote: "${option}" is required`);
 }
 
 function success(id: string | number, result: unknown): Response {
@@ -89,6 +98,8 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     private readonly adapter: Adapter<TThreadId, TRawMessage>,
     private readonly options: ServeAdapterOptions,
   ) {
+    requireOption(options.consumerUrl, "consumerUrl");
+    requireOption(options.secret, "secret");
     this.logger =
       options.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
 
@@ -99,7 +110,10 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     this.capabilities = OPTIONAL_CAPABILITIES.filter(
       (name) => typeof adapter[name] === "function",
     );
-    this.streams = new StreamRegistry({ ttlMs: options.streamTtlMs });
+    this.streams = new StreamRegistry({
+      ttlMs: options.streamTtlMs,
+      startTimeoutMs: options.streamStartTimeoutMs,
+    });
 
     this.chat = createRemoteChat({
       consumerUrl: options.consumerUrl,
@@ -111,6 +125,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       userName: adapter.userName,
       logForwardLevel: options.logForwardLevel,
       maxConcurrentForwards: options.maxConcurrentForwards,
+      maxQueuedForwards: options.maxQueuedForwards,
     });
 
     // `start()` and `ready` still surface the failure; this only keeps an
@@ -162,6 +177,19 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   }
 
   async handleRequest(request: Request): Promise<Response> {
+    // Nothing here may throw past this point: an unhandled rejection in a
+    // request handler would take down the process holding the connection.
+    try {
+      return await this.route(request);
+    } catch (error) {
+      this.logger.error("request could not be handled", { error });
+      this.options.onError?.(error, { phase: "dispatch" });
+      const wire = serializeError(error);
+      return failure(null, wire.code, wire.message, wire.data);
+    }
+  }
+
+  private async route(request: Request): Promise<Response> {
     const verified = await verifyRequest(request, this.dispatchOptions);
     if (!verified.ok) return verified.response;
 
@@ -194,6 +222,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       await this.start();
       return success(id, await encode(await this.dispatch(call.data)));
     } catch (error) {
+      // Logged in full here because the wire form is deliberately sanitised;
+      // without this an adapter failure leaves no trace on either side.
+      this.logger.error(`${call.data.method} failed`, { error });
       this.options.onError?.(error, { phase: "dispatch" });
       const wire = serializeError(error);
       return failure(id, wire.code, wire.message, wire.data);
