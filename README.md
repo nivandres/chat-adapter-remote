@@ -1,8 +1,5 @@
 # chat-adapter-remote
 
-[![npm](https://img.shields.io/npm/v/chat-adapter-remote.svg)](https://www.npmjs.com/package/chat-adapter-remote)
-[![license](https://img.shields.io/npm/l/chat-adapter-remote.svg)](./LICENSE)
-
 Run any [Chat SDK](https://chat-sdk.dev) `Adapter` in a different process from your bot logic, bridged over signed HTTP JSON-RPC.
 
 Some platforms — WhatsApp via Baileys, for example — need a process that holds a live connection continuously. This splits that connection from the bot logic: a **host** process holds the real, unmodified adapter; a **consumer** process holds the real `Chat` instance and your handlers. Neither side changes; `Chat` sees an ordinary adapter, and the adapter sees an ordinary `ChatInstance`.
@@ -12,6 +9,8 @@ npm i chat-adapter-remote
 ```
 
 ESM only, Node >= 20 or Bun. Peers: `chat` and `@chat-adapter/shared`, which must be installed at matching versions.
+
+`url`, `consumerUrl` and `secret` fall back to `CHAT_ADAPTER_REMOTE_URL`, `CHAT_ADAPTER_REMOTE_CONSUMER_URL` and `CHAT_ADAPTER_REMOTE_SECRET`.
 
 ## Host
 
@@ -57,53 +56,6 @@ Mount `chat.webhooks.remote` — not `remote.handleWebhook` — as the `consumer
 
 Pass `waitUntil` on serverless. Events are acknowledged as soon as they are accepted, so without it the runtime can freeze the handler mid-turn and the reply is never sent.
 
-## Environment variables
-
-Read when the matching option is not passed.
-
-| Variable                           | Side     | Required | Example                                       |
-| ---------------------------------- | -------- | -------- | --------------------------------------------- |
-| `CHAT_ADAPTER_REMOTE_SECRET`       | both     | yes      | `openssl rand -hex 32`                        |
-| `CHAT_ADAPTER_REMOTE_URL`          | consumer | yes      | `https://worker.example.com/rpc`              |
-| `CHAT_ADAPTER_REMOTE_CONSUMER_URL` | host     | yes      | `https://app.example.com/api/webhooks/remote` |
-
-## Configuration
-
-`createRemoteAdapter(config)` — the consumer:
-
-| Field                  | Type                          | Default         | Description                                  |
-| ---------------------- | ----------------------------- | --------------- | -------------------------------------------- |
-| `url`                  | `string`                      | env             | The host's dispatch endpoint                 |
-| `secret`               | `string`                      | env             | Shared HMAC secret                           |
-| `name`                 | `string`                      | `"remote"`      | Must match the key it is registered under    |
-| `userName`             | `string`                      | handshake       | Overrides the bot name learned from the host |
-| `timeoutMs`            | `number`                      | `10000`         | Per-request timeout                          |
-| `timestampToleranceMs` | `number`                      | `30000`         | How old a signed request may be              |
-| `maxBodyBytes`         | `number`                      | `5000000`       | Largest inbound body accepted                |
-| `maxCachedThreads`     | `number`                      | `1000`          | Thread facts kept from inbound messages      |
-| `replayGuard`          | `ReplayGuard`                 | per-process     | Share one to cover several instances         |
-| `onError`              | `(error, { method }) => void` | —               | Inbound failures                             |
-| `logger`               | `Logger`                      | `ConsoleLogger` |                                              |
-| `fetch`                | `FetchLike`                   | global          |                                              |
-
-`serveAdapter(adapter, options)` / `createAdapterHost(adapter, options)` — the host:
-
-| Field                                                                                 | Type                                   | Default  | Description                                                                              |
-| ------------------------------------------------------------------------------------- | -------------------------------------- | -------- | ---------------------------------------------------------------------------------------- |
-| `consumerUrl`                                                                         | `string`                               | env      | Where inbound events are delivered                                                       |
-| `secret`                                                                              | `string`                               | env      | Shared HMAC secret                                                                       |
-| `autoStart`                                                                           | `boolean`                              | `true`   | `createAdapterHost` always starts stopped                                                |
-| `inlineAttachments`                                                                   | `boolean \| "auto"`                    | `"auto"` | `true` always inlines, `false` never does, `"auto"` inlines while the body budget allows |
-| `attachmentTtlMs`                                                                     | `number`                               | `300000` | How long an unfetched attachment is kept                                                 |
-| `maxConcurrentForwards`                                                               | `number`                               | `8`      | Inbound messages in flight at once                                                       |
-| `maxQueuedForwards`                                                                   | `number`                               | `1000`   | Messages allowed to queue behind those                                                   |
-| `streamTtlMs`                                                                         | `number`                               | `300000` | Idle stream lifetime                                                                     |
-| `streamStartTimeoutMs`                                                                | `number`                               | `10000`  | How long the adapter may take to start streaming                                         |
-| `onReady`                                                                             | `() => void`                           | —        | Called once connected                                                                    |
-| `onError`                                                                             | `(error, { phase, threadId }) => void` | —        | `initialize`, `forward`, `dispatch`, `shutdown`                                          |
-| `logForwardLevel`                                                                     | `LogLevel`                             | `"info"` | Below this, logs stay on the host                                                        |
-| `timeoutMs`, `timestampToleranceMs`, `maxBodyBytes`, `replayGuard`, `logger`, `fetch` |                                        |          | As above                                                                                 |
-
 ## Lifecycle
 
 `serveAdapter` connects during construction. `createAdapterHost` is the same host left stopped:
@@ -142,7 +94,7 @@ At-most-once: a failed forward is logged and dropped, and an acknowledgement mea
 
 Chat serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers — set a `queue` concurrency strategy on the consumer's `Chat` if you need every message. This matters here because a host draining a backlog after a reconnect sends exactly that shape of burst.
 
-Attachments are inlined as base64 and bounded by `maxBodyBytes` (5 MB default), which has to be raised on **both** sides. For anything larger, give the attachment a `url` instead: the platform fetches it directly and it never crosses the bridge.
+Attachments are inlined as base64 while they fit `maxBodyBytes` (5 MB default, raise it on **both** sides). Past that the host keeps the bytes and the consumer reads them through `fetchData()`, which is what the SDK already calls — set `inlineAttachments` to `true` or `false` to force either. For anything large, give the attachment a `url` instead: the platform fetches it directly and it never crosses the bridge.
 
 ## Security
 
