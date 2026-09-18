@@ -1,4 +1,5 @@
 import { decode, encode } from "./codec";
+import { readBody } from "./dispatch";
 import { JsonRpcResponseSchema, isErrorResponse } from "./envelope";
 import {
   RemoteAdapterRpcError,
@@ -12,6 +13,7 @@ export interface RpcClientOptions {
   url: string;
   secret: string;
   timeoutMs?: number;
+  maxBodyBytes?: number;
   fetch?: FetchLike;
 }
 
@@ -24,6 +26,7 @@ export interface RpcClient {
 export function createRpcClient(options: RpcClientOptions): RpcClient {
   const doFetch = options.fetch ?? fetch;
   const timeoutMs = options.timeoutMs ?? 10_000;
+  const maxBodyBytes = options.maxBodyBytes ?? Number.POSITIVE_INFINITY;
   let nextId = 1;
 
   async function send(
@@ -60,7 +63,15 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     async request(method, params) {
       const id = nextId++;
       const response = await send(method, params, id);
-      const text = await response.text();
+      // Bounded like a request: a deferred attachment is fetched through here,
+      // and the whole point of deferring it was that it did not fit a body.
+      const text = await readBody(response, maxBodyBytes);
+      if (text === null) {
+        throw new RemoteAdapterRpcError(
+          RpcErrorCode.INVALID_REQUEST,
+          `chat-adapter-remote: response larger than ${maxBodyBytes} bytes`,
+        );
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(text);

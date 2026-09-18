@@ -166,6 +166,7 @@ export class RemoteAdapter<
     this.persistThreadHistory = handshake.persistThreadHistory;
     this.supportsTurnCancellation = handshake.supportsTurnCancellation;
     this.applyCapabilities(handshake.capabilities);
+    this.applyCustomMethods(handshake.customMethods);
   }
 
   /** Chat decides what an adapter can do with `adapter.x?.()`, so anything the host did not report is removed from this instance. */
@@ -174,6 +175,16 @@ export class RemoteAdapter<
     const supported = new Set(capabilities);
     for (const name of OPTIONAL_CAPABILITIES) {
       if (!supported.has(name)) Reflect.set(this, name, undefined);
+    }
+  }
+
+  /** Never replaces something this adapter already has, so the host cannot redefine the interface. */
+  private applyCustomMethods(names?: string[]): void {
+    for (const name of names ?? []) {
+      if (name in this) continue;
+      Reflect.set(this, name, (...args: unknown[]) =>
+        this.rpc.request("custom", [name, args]),
+      );
     }
   }
 
@@ -292,9 +303,18 @@ export class RemoteAdapter<
   private rebuild(wire: unknown): Message {
     return deserializeMessage(wire, (wired) => {
       const held = wired[ATTACHMENT_REF];
-      if (held)
-        return () =>
-          this.rpc.request("fetchAttachment", [held]) as Promise<Buffer>;
+      if (held) {
+        let pending: Promise<Buffer> | undefined;
+        return () => {
+          pending ??= (
+            this.rpc.request("fetchAttachment", [held]) as Promise<Buffer>
+          ).catch((error: unknown) => {
+            pending = undefined;
+            throw error;
+          });
+          return pending;
+        };
+      }
       // No bytes and no id: readable only if the host's adapter can rebuild it
       // from the metadata it sent, which the handshake already told us.
       if (!wired.fetchMetadata || !this.rehydrateAttachment) return undefined;
@@ -785,8 +805,32 @@ export class RemoteAdapter<
   }
 }
 
-export function createRemoteAdapter<TThreadId = unknown, TRawMessage = unknown>(
+type ThreadIdOf<A> = A extends Adapter<infer T, infer _R> ? T : unknown;
+type RawMessageOf<A> = A extends Adapter<infer _T, infer R> ? R : unknown;
+
+/** What is left once the interface is removed. Crossing the wire makes every one of them async. */
+type CustomOf<A> = {
+  [
+    K in keyof A as K extends keyof Adapter
+      ? never
+      : K extends `_${string}`
+        ? never
+        : A[K] extends (...args: never[]) => unknown
+          ? K
+          : never
+  ]: A[K] extends (...args: infer P) => infer R
+    ? (...args: P) => Promise<Awaited<R>>
+    : never;
+};
+
+export type RemoteOf<A extends Adapter> = RemoteAdapter<
+  ThreadIdOf<A>,
+  RawMessageOf<A>
+> &
+  CustomOf<A>;
+
+export function createRemoteAdapter<TAdapter extends Adapter = Adapter>(
   config: RemoteAdapterConfig,
-): RemoteAdapter<TThreadId, TRawMessage> {
-  return new RemoteAdapter(config);
+): RemoteOf<TAdapter> {
+  return new RemoteAdapter(config) as RemoteOf<TAdapter>;
 }

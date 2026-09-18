@@ -30,7 +30,7 @@ export interface RemoteAdapterConfig {
   timeoutMs?: number;
   /** Rejects inbound requests whose signed timestamp is older than this. Default 30s. */
   timestampToleranceMs?: number;
-  /** Rejects inbound bodies larger than this. Default 5MB. */
+  /** Rejects inbound bodies larger than this. Unlimited by default: both ends are trusted. */
   maxBodyBytes?: number;
   /** Receives failures that would otherwise only reach the logger. */
   onError?: RemoteAdapterErrorHandler;

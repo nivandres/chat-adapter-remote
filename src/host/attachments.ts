@@ -12,6 +12,8 @@ import { ExpiringMap } from "./expiring";
 export type InlineAttachments = boolean | "auto";
 
 const BASE64_RATIO = 4 / 3;
+/** What `"auto"` weighs against when no body limit was set: runtimes cap request bodies around here. */
+export const DEFAULT_ATTACHMENT_BUDGET = 4_000_000;
 /** The rest of the message, the envelope and the signature share the body too. */
 const BUDGET_SHARE = 0.8;
 
@@ -31,11 +33,11 @@ export class AttachmentRegistry {
     return this.held.add("a", read);
   }
 
-  /** Single use: the consumer rebuilds its own closure around what it receives. */
+  /** Kept until it expires: `fetchData` carries no promise of being called once. */
   read(id: string): Promise<AttachmentBytes> | undefined {
     const read = this.held.get(id);
     if (!read) return undefined;
-    this.held.delete(id);
+    this.held.touch(id);
     return read();
   }
 

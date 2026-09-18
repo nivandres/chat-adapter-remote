@@ -131,13 +131,10 @@ class RemoteChat {
     const wire: EventPayload = { ...event };
     for (const key of LOCAL_EVENT_KEYS) delete wire[key];
 
+    const policy = this.options.attachments?.();
     for (const key of EVENT_MESSAGE_KEYS) {
       const message = await this.resolveMessage(wire[key]);
-      if (message)
-        wire[key] = await serializeMessage(
-          message,
-          this.options.attachments?.(),
-        );
+      if (message) wire[key] = await serializeMessage(message, policy);
       else delete wire[key];
     }
     // EmojiValue.toJSON() gives a placeholder, not the name the consumer needs.

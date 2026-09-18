@@ -67,6 +67,7 @@ export const HandshakeSchema = z
     persistThreadHistory: z.boolean().optional(),
     supportsTurnCancellation: z.boolean().optional(),
     capabilities: z.array(z.string()).optional(),
+    customMethods: z.array(z.string()).optional(),
   })
   .passthrough();
 
@@ -288,6 +289,13 @@ export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
       method: z.literal("cancelScheduledMessage"),
       id: Id,
       params: z.tuple([z.string()]),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal("custom"),
+      id: Id,
+      params: z.tuple([z.string(), z.array(z.unknown())]),
     })
     .strict(),
   z

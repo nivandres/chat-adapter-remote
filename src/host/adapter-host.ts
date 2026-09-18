@@ -42,8 +42,10 @@ import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
 import {
   AttachmentBudget,
   AttachmentRegistry,
+  DEFAULT_ATTACHMENT_BUDGET,
   type InlineAttachments,
 } from "./attachments";
+import { resolveCustomMethods } from "./custom-methods";
 import { StreamRegistry } from "./streams";
 
 export interface ServeAdapterOptions extends DispatchOptions {
@@ -76,6 +78,11 @@ export interface ServeAdapterOptions extends DispatchOptions {
   inlineAttachments?: InlineAttachments;
   /** How long an attachment the consumer never fetched is kept. Default 5 minutes. */
   attachmentTtlMs?: number;
+  /**
+   * Adapter methods outside the `Adapter` interface that the consumer may
+   * call. `true` exposes the adapter's own public methods.
+   */
+  customMethods?: string[] | true;
 }
 
 /** Both are deployment mistakes: failing here beats failing on the first request. */
@@ -114,6 +121,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private readonly logger: Logger;
   private readonly dispatchOptions: DispatchOptions;
   private readonly capabilities: OptionalCapability[];
+  private readonly customMethods: string[];
   private readonly streams: StreamRegistry;
   private readonly attachments: AttachmentRegistry;
   private readonly scheduled = new Map<string, ScheduledMessage<TRawMessage>>();
@@ -143,6 +151,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     this.capabilities = OPTIONAL_CAPABILITIES.filter(
       (name) => typeof adapter[name] === "function",
     );
+    this.customMethods = resolveCustomMethods(adapter, options.customMethods);
     this.streams = new StreamRegistry({
       ttlMs: options.streamTtlMs,
       startTimeoutMs: options.streamStartTimeoutMs,
@@ -274,7 +283,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     return {
       budget: new AttachmentBudget(
         this.options.inlineAttachments ?? "auto",
-        this.options.maxBodyBytes ?? 5_000_000,
+        this.options.maxBodyBytes ?? DEFAULT_ATTACHMENT_BUDGET,
       ),
       registry: this.attachments,
       rehydratable: typeof this.adapter.rehydrateAttachment === "function",
@@ -317,6 +326,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
             adapter.persistThreadHistory ?? adapter.persistMessageHistory,
           supportsTurnCancellation: adapter.supportsTurnCancellation,
           capabilities: this.capabilities,
+          customMethods: this.customMethods,
         };
       case "postMessage":
         return adapter.postMessage(first, params[1] as AdapterPostableMessage);
@@ -474,6 +484,18 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
         this.scheduled.delete(first);
         return scheduled.cancel();
       }
+      case "custom": {
+        if (!this.customMethods.includes(first)) {
+          throw new RemoteAdapterRpcError(
+            RpcErrorCode.METHOD_NOT_IMPLEMENTED,
+            `chat-adapter-remote: "${first}" is not exposed by this host`,
+          );
+        }
+        const method = this.adapter[first as keyof Adapter] as unknown as (
+          ...args: unknown[]
+        ) => unknown;
+        return method.apply(this.adapter, params[1] as unknown[]);
+      }
       case "fetchAttachment": {
         const bytes = this.attachments.read(first);
         if (!bytes) {
@@ -523,11 +545,14 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private async serializeFetchResult(
     result: FetchResult<TRawMessage>,
   ): Promise<unknown> {
+    // One budget for the whole response: it is one body, however many
+    // messages share it.
+    const policy = this.attachmentPolicy();
     return {
       ...result,
       messages: await Promise.all(
         result.messages.map((message) =>
-          serializeMessage(message as Message, this.attachmentPolicy()),
+          serializeMessage(message as Message, policy),
         ),
       ),
     };
@@ -536,6 +561,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private async serializeListThreads(
     result: ListThreadsResult<TRawMessage>,
   ): Promise<unknown> {
+    const policy = this.attachmentPolicy();
     return {
       ...result,
       threads: await Promise.all(
@@ -543,7 +569,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
           ...thread,
           rootMessage: await serializeMessage(
             thread.rootMessage as Message,
-            this.attachmentPolicy(),
+            policy,
           ),
         })),
       ),

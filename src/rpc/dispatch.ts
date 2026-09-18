@@ -12,6 +12,7 @@ export interface DispatchOptions {
   secret: string;
   /** Rejects requests whose signed timestamp is older than this. Default 30s. */
   timestampToleranceMs?: number;
+  /** Rejects bodies larger than this. Unlimited by default: both ends are trusted. */
   maxBodyBytes?: number;
   /** Rejects a signature that was already accepted inside the freshness window. */
   replayGuard?: ReplayGuard;
@@ -31,8 +32,8 @@ function errorResponse(status: number, error: RpcErrorObject): Response {
 }
 
 /** Reads at most `maxBytes`, returning null past the limit rather than buffering the rest. */
-async function readBody(
-  request: Request,
+export async function readBody(
+  request: Request | Response,
   maxBytes: number,
 ): Promise<string | null> {
   const declared = request.headers.get("content-length");
@@ -67,7 +68,10 @@ export async function verifyRequest(
   request: Request,
   options: DispatchOptions,
 ): Promise<VerifiedRequest> {
-  const rawBody = await readBody(request, options.maxBodyBytes ?? 5_000_000);
+  const rawBody = await readBody(
+    request,
+    options.maxBodyBytes ?? Number.POSITIVE_INFINITY,
+  );
   if (rawBody === null) {
     return {
       ok: false,
