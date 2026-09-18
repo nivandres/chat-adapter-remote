@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+Attachment bytes no longer have to travel inside the message. Both sides must be upgraded together: the protocol version is now 3.
+
+### Added
+
+- `inlineAttachments`, defaulting to `"auto"`. Small media still travels inside the message; once it would not fit the body budget the host keeps the bytes and sends an id, and the consumer's `fetchData()` pulls them when a handler actually reads the attachment. When the platform reported a size, an oversized attachment is never even downloaded on the host. `true` and `false` force either behaviour. Nothing here is adapter-specific — the host holds whatever the adapter already knew how to do, so it works for adapters that implement neither `rehydrateAttachment` nor `fetchMetadata`.
+- `attachmentTtlMs`, how long bytes the consumer never fetched are kept.
+- `url` and `secret` fall back to `CHAT_ADAPTER_REMOTE_URL`, `CHAT_ADAPTER_REMOTE_CONSUMER_URL` and `CHAT_ADAPTER_REMOTE_SECRET`, and a missing one now throws `ValidationError` from `@chat-adapter/shared` rather than a plain `Error`.
+
+### Changed
+
+- `PROTOCOL_VERSION` is 3. A serialized attachment can now carry a reference instead of its bytes, so an older consumer would silently receive media it cannot read; the handshake refuses the pairing instead.
+- The published package no longer ships `CHANGELOG.md`, matching the Chat SDK publishing checklist.
+
 ## 0.2.1
 
 Hardening pass driven by running 0.2.0 against a real WhatsApp adapter, plus the rest of the inbound surface.
@@ -87,6 +102,7 @@ A correctness pass against real adapter objects, plus an expansion of the bridge
 
 Initial release.
 
+[0.3.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nivandres/chat-adapter-remote/releases/tag/v0.1.0
