@@ -29,7 +29,7 @@ import type {
 } from "chat";
 import { ConsoleLogger, getEmoji } from "chat";
 
-import { decode } from "./rpc/codec";
+import { decode, encode } from "./rpc/codec";
 import { verifyRequest } from "./rpc/dispatch";
 import { RpcErrorCode, serializeError } from "./rpc/errors";
 import { deserializeMessage, serializeMessage } from "./rpc/message-wire";
@@ -625,7 +625,7 @@ export class RemoteAdapter<
       return Response.json({
         jsonrpc: "2.0",
         id: call.data.id,
-        result: answer ?? null,
+        result: (await encode(answer)) ?? null,
       });
     } catch (error) {
       const wireError = serializeError(error);

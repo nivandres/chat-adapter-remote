@@ -71,6 +71,7 @@ export class StreamRegistry {
   private readonly streams = new Map<string, PendingStream>();
   private readonly ttlMs: number;
   private readonly startTimeoutMs: number;
+  private sweeper?: ReturnType<typeof setInterval>;
   private sequence = 0;
 
   constructor(options: StreamRegistryOptions = {}) {
@@ -124,6 +125,7 @@ export class StreamRegistry {
       result,
       expiresAt: Date.now() + this.ttlMs,
     });
+    this.watch();
     return { streamId };
   }
 
@@ -149,6 +151,25 @@ export class StreamRegistry {
   clear(): void {
     for (const stream of this.streams.values()) stream.queue.close();
     this.streams.clear();
+    this.unwatch();
+  }
+
+  /**
+   * Armed only while streams are open, and unref'd so it never holds the
+   * process alive. Without it a stream abandoned mid-flight — a consumer that
+   * lost its connection — would keep the adapter blocked on an iterable that
+   * never ends, until some later stream happened to trigger a sweep.
+   */
+  private watch(): void {
+    if (this.sweeper) return;
+    this.sweeper = setInterval(() => this.sweep(), this.ttlMs);
+    this.sweeper.unref?.();
+  }
+
+  private unwatch(): void {
+    if (!this.sweeper) return;
+    clearInterval(this.sweeper);
+    this.sweeper = undefined;
   }
 
   private require(streamId: string): PendingStream {
@@ -171,5 +192,6 @@ export class StreamRegistry {
       this.streams.delete(streamId);
       stream.queue.close();
     }
+    if (this.streams.size === 0) this.unwatch();
   }
 }

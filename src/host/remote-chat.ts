@@ -169,7 +169,11 @@ class RemoteChat {
     try {
       const wire = await this.serializeEvent(event);
       const params = contextId === undefined ? [wire] : [wire, contextId];
-      return await this.limit(() => this.rpc.request(method, params));
+      // Deliberately outside the forward limiter: the platform times these out
+      // after a few seconds, and a burst of inbound messages would otherwise
+      // put a modal submit behind the whole backlog. They are paced by a human
+      // clicking, so they cannot flood anything on their own.
+      return await this.rpc.request(method, params);
     } catch (error) {
       this.logger.error(`failed to deliver ${method} to consumer`, {
         threadId,

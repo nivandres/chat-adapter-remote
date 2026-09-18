@@ -403,11 +403,5 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
     .strict(),
 ]);
 
-/** Inbound calls whose answer the host has to relay back to the platform. */
-export const ANSWERED_EVENTS = [
-  "processModalSubmit",
-  "processOptionsLoad",
-] as const;
-
 /** Event payload keys that can carry a serialized `Message`. */
 export const EVENT_MESSAGE_KEYS = ["message", "previousMessage"] as const;
