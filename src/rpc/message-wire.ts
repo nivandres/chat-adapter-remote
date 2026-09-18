@@ -39,7 +39,11 @@ export function deserializeMessage(wire: unknown): Message {
   const message = MessageClass.fromJSON(decoded);
   message.attachments = message.attachments.map((attachment, index) => {
     const data = decoded.attachments?.[index]?.data;
-    return data ? { ...attachment, data } : attachment;
+    // `fetchData` is what the SDK reads: `toAiMessages` drops an image that
+    // only carries `data`, and rehydration keys off its absence.
+    return data
+      ? { ...attachment, data, fetchData: async () => data }
+      : attachment;
   });
   return message;
 }

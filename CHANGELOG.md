@@ -6,6 +6,7 @@ Hardening pass driven by running 0.2.0 against a real WhatsApp adapter, plus the
 
 ### Fixed
 
+- Delivered attachments carried `data` but no `fetchData`, which is what the SDK actually reads. `toAiMessages` drops an image that only has `data`, so media forwarded through the bridge disappeared on its way to a model. Both are now present.
 - Modal submits and options loads queued behind inbound message forwards, so a backlog could push them past the few seconds the platform allows before the user sees a connection error. They no longer go through the forward limiter: they are paced by a human clicking and cannot flood it.
 - The consumer returned the answer to those two without running it through the codec, the one place a value crossed the wire uncoded.
 - A stream abandoned mid-flight was only reclaimed by a later stream call, so a consumer that lost its connection could leave the adapter blocked on an iterable that never ended. A sweep now runs while streams are open, unref'd so it never holds the process alive.

@@ -131,6 +131,12 @@ describe("message wire", () => {
       }),
       onError,
     );
+    // The SDK reads attachments through fetchData, so a delivered attachment
+    // has to expose it or `toAiMessages` silently drops the image.
+    const rebuilt = deserializeMessage(resolved).attachments[0]!;
+    expect(typeof rebuilt.fetchData).toBe("function");
+    expect((await rebuilt.fetchData!()).toString()).toBe("bytes");
+
     expect(deserializeMessage(failed).attachments[0]!.data).toBeUndefined();
     expect(deserializeMessage(failed).attachments[0]!.name).toBe("gone.txt");
     expect(onError).toHaveBeenCalled();
