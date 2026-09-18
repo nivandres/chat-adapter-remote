@@ -171,6 +171,43 @@ describe("streaming", () => {
     ).rejects.toThrow(/Internal adapter error/);
   });
 
+  it("gives up on an adapter that never starts streaming", async () => {
+    // Shorter than the client timeout, so the host answers before the consumer
+    // gives up and nothing is left holding the request open.
+    const b = bridge(
+      { stream: vi.fn(() => new Promise(() => {})) as never },
+      { streamStartTimeoutMs: 20 },
+    );
+    await handshake(b);
+
+    await expect(
+      b.remote.stream!(THREAD, source(["a"]).iterable),
+    ).rejects.toThrow(/did not start streaming/);
+  });
+
+  it("ends the stream when a push fails mid-flight", async () => {
+    const b = streamingBridge(async (_threadId, chunks) => {
+      for await (const _chunk of chunks) void _chunk;
+      return null;
+    });
+    await handshake(b);
+    const rpc = Reflect.get(b.remote, "rpc") as {
+      request: (method: string, params: unknown) => Promise<unknown>;
+    };
+    const original = rpc.request.bind(rpc);
+    let ended: boolean | undefined;
+    rpc.request = async (method, params) => {
+      if (method === "streamPush") throw new Error("network died");
+      if (method === "streamEnd") ended = (params as [string, boolean])[1];
+      return original(method, params);
+    };
+
+    await expect(
+      b.remote.stream!(THREAD, source(["a", "b"]).iterable),
+    ).rejects.toThrow(/network died/);
+    expect(ended).toBe(true);
+  });
+
   it("refuses a push for a stream it does not know", async () => {
     const b = streamingBridge(async () => null);
     await handshake(b);

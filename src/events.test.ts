@@ -136,6 +136,85 @@ describe("inbound events", () => {
   });
 });
 
+describe("events that carry an answer back", () => {
+  it("returns the consumer's modal response to the host", async () => {
+    const b = bridge();
+    await handshake(b);
+    b.chat.onModalSubmit("report", async () => ({
+      action: "update" as const,
+      modal: {
+        type: "modal" as const,
+        callbackId: "report",
+        title: "Done",
+        children: [],
+      },
+    }));
+
+    const answer = await b.hostChat().processModalSubmit(
+      {
+        adapter: b.adapter,
+        callbackId: "report",
+        values: { field: "value" },
+        raw: {},
+        threadId: THREAD,
+        user,
+      } as never,
+      "ctx-1",
+    );
+
+    expect(answer).toMatchObject({ action: "update" });
+  });
+
+  it("returns select options to the host", async () => {
+    const b = bridge();
+    await handshake(b);
+    b.chat.onOptionsLoad("pick", async () => [
+      { label: "One", value: "1" },
+      { label: "Two", value: "2" },
+    ]);
+
+    const answer = (await b.hostChat().processOptionsLoad({
+      adapter: b.adapter,
+      actionId: "pick",
+      query: "o",
+      raw: {},
+      user,
+    } as never)) as { options?: unknown[] } | unknown[];
+
+    expect(JSON.stringify(answer)).toContain("One");
+  });
+
+  it("resolves to undefined rather than throwing when the consumer is unreachable", async () => {
+    const { createRemoteChat } = await import("./host/remote-chat");
+    const chat = createRemoteChat({
+      consumerUrl: "https://consumer.test/inbound",
+      secret: "x".repeat(32),
+      fetch: async () => {
+        throw new Error("connection refused");
+      },
+    });
+
+    await expect(
+      chat.processModalSubmit({ callbackId: "x" } as never, undefined),
+    ).resolves.toBeUndefined();
+  });
+
+  it("delivers the fire-and-forget platform events", async () => {
+    const b = bridge();
+    await handshake(b);
+    const joined = deferred<string>();
+    b.chat.onMemberJoinedChannel(async (event) => joined.resolve(event.userId));
+
+    b.hostChat().processMemberJoinedChannel({
+      adapter: b.adapter,
+      channelId: "mock:general",
+      userId: "u9",
+    } as never);
+
+    expect(await joined.promise).toBe("u9");
+  });
+});
+
 describe("methods that keep a live object on the host", () => {
   it("schedules a message and cancels it through the host", async () => {
     const cancel = vi.fn(async () => undefined);

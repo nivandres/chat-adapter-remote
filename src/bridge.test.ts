@@ -4,6 +4,7 @@ import { Message } from "chat";
 import { describe, expect, it, vi } from "vitest";
 
 import { createRemoteAdapter } from "./adapter";
+import { serveAdapter } from "./host";
 import { serializeMessage } from "./rpc/message-wire";
 import { OPTIONAL_CAPABILITIES, type OptionalCapability } from "./rpc/methods";
 import { sign } from "./rpc/signing";
@@ -328,6 +329,89 @@ describe("failure containment", () => {
   });
 });
 
+describe("misconfiguration", () => {
+  it("names the missing option at construction instead of failing on the first request", () => {
+    expect(() => createRemoteAdapter({ secret: SECRET } as never)).toThrow(
+      /"url" is required/,
+    );
+    expect(() => createRemoteAdapter({ url: HOST_URL } as never)).toThrow(
+      /"secret" is required/,
+    );
+    expect(() =>
+      serveAdapter(createMockAdapter("mock"), { secret: SECRET } as never),
+    ).toThrow(/"consumerUrl" is required/);
+    expect(() =>
+      serveAdapter(createMockAdapter("mock"), {
+        consumerUrl: CONSUMER_URL,
+      } as never),
+    ).toThrow(/"secret" is required/);
+  });
+
+  it("answers rather than throwing when verification itself fails", async () => {
+    const b = bridge();
+    await b.host.ready;
+    // A body that is not a stream and not text, so readBody throws internally.
+    const hostile = new Request(HOST_URL, { method: "POST", body: "{}" });
+    Object.defineProperty(hostile, "body", {
+      get() {
+        throw new Error("stream exploded");
+      },
+    });
+
+    const response = await b.host.handleRequest(hostile);
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).error).toBeDefined();
+  });
+
+  it("routes consumer-side inbound failures to onError", async () => {
+    const onError = vi.fn();
+    const remote = createRemoteAdapter({
+      url: HOST_URL,
+      secret: SECRET,
+      name: "mock",
+      onError,
+      fetch: async (_url, init) =>
+        Response.json({
+          jsonrpc: "2.0",
+          id: JSON.parse(String(init?.body)).id,
+          result: { protocolVersion: 2, name: "mock", userName: "mock-bot" },
+        }),
+    });
+    await remote.initialize({
+      processMessage: () => Promise.reject(new Error("handler blew up")),
+      getLogger: () => console,
+    } as never);
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "processMessage",
+      params: [
+        THREAD,
+        await serializeMessage(message("hi")),
+        { channelId: "mock:general" },
+      ],
+    });
+    const timestamp = String(Date.now());
+
+    await remote.handleWebhook(
+      new Request(CONSUMER_URL, {
+        method: "POST",
+        body,
+        headers: {
+          "x-chat-adapter-remote-signature": sign(body, timestamp, SECRET),
+          "x-chat-adapter-remote-timestamp": timestamp,
+        },
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), {
+      method: "processMessage",
+    });
+  });
+});
+
 describe("request verification", () => {
   function signed(
     body: string,
@@ -399,6 +483,28 @@ describe("request verification", () => {
       expect((await response.json()).error.code).toBeDefined();
     }
     expect(b.adapter.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("surfaces why a request was rejected instead of an id mismatch", async () => {
+    // These answer with `id: null`, so matching the id first would hide them.
+    const cases: Array<[string, string, RegExp]> = [
+      ["wrong secret", "nope".repeat(8), /signature/i],
+      ["oversized body", SECRET, /too large/i],
+    ];
+
+    for (const [, secret, expected] of cases) {
+      const b = bridge();
+      await b.host.ready;
+      const remote = createRemoteAdapter({
+        url: HOST_URL,
+        secret,
+        name: "mock",
+        fetch: (input, init) => b.host.fetch(new Request(input, init)),
+      });
+
+      const body = secret === SECRET ? "x".repeat(6_000_000) : "hi";
+      await expect(remote.postMessage(THREAD, body)).rejects.toThrow(expected);
+    }
   });
 
   it("refuses an inbound event that arrives before the consumer initializes", async () => {

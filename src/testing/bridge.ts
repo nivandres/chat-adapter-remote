@@ -10,7 +10,11 @@ import {
 import { vi } from "vitest";
 
 import { createRemoteAdapter, type RemoteAdapter } from "../adapter";
-import { serveAdapter, type AdapterHost } from "../host";
+import {
+  serveAdapter,
+  type AdapterHost,
+  type ServeAdapterOptions,
+} from "../host";
 import type { FetchLike } from "../types";
 
 export const SECRET =
@@ -55,7 +59,10 @@ export interface Bridge {
 }
 
 /** A consumer and a host wired to each other through an in-memory `fetch`, exercising the real HTTP request/response path. */
-export function bridge(overrides: Partial<Adapter> = {}): Bridge {
+export function bridge(
+  overrides: Partial<Adapter> = {},
+  hostOptions: Partial<ServeAdapterOptions> = {},
+): Bridge {
   let captured: ChatInstance | undefined;
   const adapter = createMockAdapter("mock", {
     initialize: vi.fn(async (chatInstance: ChatInstance) => {
@@ -77,6 +84,7 @@ export function bridge(overrides: Partial<Adapter> = {}): Bridge {
     secret: SECRET,
     consumerUrl: CONSUMER_URL,
     fetch: loopback,
+    ...hostOptions,
   });
   const remote = createRemoteAdapter({
     url: HOST_URL,
