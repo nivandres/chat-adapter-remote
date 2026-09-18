@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0
+
+### Fixed
+
+- Responses had no size limit: `maxBodyBytes` only covered requests, so a deferred attachment could be pulled into the consumer unbounded — exactly the case deferring exists to avoid. Responses are now read under the same limit.
+- The attachment budget was spent per message rather than per body, so `fetchMessages`, `fetchChannelMessages` and `listThreads` could still inline past the limit. One budget now covers a whole response, and an event carrying two messages shares one.
+- A deferred attachment could only be read once, because the host dropped it as it was read. It is now kept until it expires and the consumer memoises the fetch, so reading it twice works and a failed read can be retried.
+- `customMethods: true` exposed lifecycle methods like `connect` and callback-shaped `onSomething` methods, neither of which can work over RPC. Discovery skips both; an explicit list still wins for anything else.
+
+### Changed
+
+- `maxBodyBytes` is unlimited by default. It guarded the window before a signature can be checked, but both ends of this bridge are yours, and on the consumer the runtime already caps request bodies well below the old 5 MB default. Set it if an endpoint is reachable from somewhere you do not control. `"auto"` attachments keep their own threshold, so deferring still works when no limit is set.
+
+### Added
+
+- `customMethods` on the host, exposing adapter methods outside the `Adapter` interface so platform-specific calls reach the consumer over the same signed protocol. A `string[]` names them; `true` exposes the adapter's own public methods, skipping `constructor`, `_`-prefixed names and the interface itself. Off by default: the wire picks from a list the host decided on, it never selects what to call.
+- `createRemoteAdapter<TAdapter>()` takes the original adapter type and derives its thread and raw-message types along with those custom methods, so `createRemoteAdapter<BaileysAdapter>()` types `setPresence` and friends from the source. Crossing the wire makes them all async, so a synchronous method is typed as returning a promise of what it returned.
+
+### Changed
+
+- `createRemoteAdapter` takes one type parameter, the adapter type, instead of `<TThreadId, TRawMessage>`. Calls without explicit type arguments are unaffected.
+
 ## 0.3.0
 
 Attachment bytes no longer have to travel inside the message. Both sides must be upgraded together: the protocol version is now 3.
@@ -102,6 +124,7 @@ A correctness pass against real adapter objects, plus an expansion of the bridge
 
 Initial release.
 
+[0.4.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.1.0...v0.2.0

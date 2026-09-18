@@ -84,6 +84,15 @@ The host reports which optional members its adapter actually implements, and the
 
 `isDM`, `channelIdFromThreadId` and `getChannelVisibility` are answered from facts the host sends with each message. A thread the consumer has not seen yet falls back to the SDK defaults.
 
+Methods outside the `Adapter` interface are not exposed unless the host says so. List them with `customMethods`, or pass `true` for the adapter's own public methods, and they arrive on the consumer over the same signed protocol:
+
+```ts
+serveAdapter(whatsapp, { secret, consumerUrl, customMethods: ["setPresence"] });
+
+const remote = createRemoteAdapter<BaileysAdapter>({ url, secret });
+await remote.setPresence(jid, "composing");
+```
+
 ## Streaming
 
 Adapters with native streaming get it. When the host's adapter declines to stream, Chat's own post-and-edit fallback takes over as usual.
@@ -94,13 +103,13 @@ At-most-once: a failed forward is logged and dropped, and an acknowledgement mea
 
 Chat serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers — set a `queue` concurrency strategy on the consumer's `Chat` if you need every message. This matters here because a host draining a backlog after a reconnect sends exactly that shape of burst.
 
-Attachments are inlined as base64 while they fit `maxBodyBytes` (5 MB default, raise it on **both** sides). Past that the host keeps the bytes and the consumer reads them through `fetchData()`, which is what the SDK already calls — set `inlineAttachments` to `true` or `false` to force either. For anything large, give the attachment a `url` instead: the platform fetches it directly and it never crosses the bridge.
+Attachments are inlined as base64 while they stay under about 4 MB, or under `maxBodyBytes` when you set one. Past that the host keeps the bytes and the consumer reads them through `fetchData()`, which is what the SDK already calls — set `inlineAttachments` to `true` or `false` to force either. For anything large, give the attachment a `url` instead: the platform fetches it directly and it never crosses the bridge.
 
 ## Security
 
 - Every request in both directions is HMAC-SHA256 signed over the raw body and compared in constant time.
 - Signatures are single-use inside a tolerance window. The default replay store is per-process; pass a `replayGuard` — `seen()` may be async — to share one across instances.
-- Bodies are rejected past `maxBodyBytes` while being read.
+- `maxBodyBytes` bounds how much is read from a request or a response. It is unlimited by default, since both ends are yours; set it if either endpoint is reachable from somewhere you do not control.
 - Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
 - One shared secret covers both directions, with no key id or rotation path. A leaked secret grants full send-as-the-bot access.
 
