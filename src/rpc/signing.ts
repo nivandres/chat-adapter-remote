@@ -1,4 +1,4 @@
-import crypto from "crypto";
+import crypto from "node:crypto";
 
 export const SIGNATURE_HEADER = "x-chat-adapter-remote-signature";
 export const TIMESTAMP_HEADER = "x-chat-adapter-remote-timestamp";

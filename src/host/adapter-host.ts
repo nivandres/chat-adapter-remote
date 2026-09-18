@@ -4,6 +4,7 @@ import type {
   FetchResult,
   Logger,
   Message,
+  WebhookOptions,
 } from "chat";
 
 import { decode, encode } from "../rpc/codec";
@@ -11,8 +12,9 @@ import { verifyRequest, type DispatchOptions } from "../rpc/dispatch";
 import { RpcErrorCode, serializeError } from "../rpc/errors";
 import { serializeMessage } from "../rpc/message-wire";
 import { OUTBOUND_CALLS, PROTOCOL_VERSION } from "../rpc/methods";
-import { createRemoteChat } from "./remote-chat";
 import type { FetchLike } from "../types";
+import type { LogLevel } from "./logger-bridge";
+import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
 
 export interface ServeAdapterOptions extends DispatchOptions {
   /** URL of the consumer's inbound endpoint. */
@@ -20,6 +22,16 @@ export interface ServeAdapterOptions extends DispatchOptions {
   timeoutMs?: number;
   logger?: Logger;
   fetch?: FetchLike;
+  /** Receives failures from every phase, so they can be routed to alerting. */
+  onError?: HostErrorHandler;
+  /** Called once the wrapped adapter has initialized. */
+  onReady?: () => void;
+  /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
+  logForwardLevel?: LogLevel;
+  /** Inbound messages forwarded at once. Default 8. */
+  maxConcurrentForwards?: number;
+  /** Initialize during construction. Default true; set false to control startup with start(). */
+  autoStart?: boolean;
 }
 
 function success(id: string | number, result: unknown): Response {
@@ -42,29 +54,73 @@ function failure(
  * stand-in `ChatInstance` whose calls forward back to the consumer.
  */
 export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
-  private readonly initialized: Promise<void>;
+  private readonly chat;
+  private starting?: Promise<void>;
+  private stopped = false;
 
   constructor(
     private readonly adapter: Adapter<TThreadId, TRawMessage>,
     private readonly options: ServeAdapterOptions,
   ) {
-    this.initialized = adapter.initialize(
-      createRemoteChat({
-        consumerUrl: options.consumerUrl,
-        secret: options.secret,
-        timeoutMs: options.timeoutMs,
-        logger: options.logger,
-        fetch: options.fetch,
-      }),
-    );
-    // `ready` still surfaces the failure; this only stops an unobserved
-    // rejection from killing the process before a request arrives.
-    this.initialized.catch(() => {});
+    this.chat = createRemoteChat({
+      consumerUrl: options.consumerUrl,
+      secret: options.secret,
+      timeoutMs: options.timeoutMs,
+      logger: options.logger,
+      fetch: options.fetch,
+      onError: options.onError,
+      logForwardLevel: options.logForwardLevel,
+      maxConcurrentForwards: options.maxConcurrentForwards,
+    });
+
+    // `start()` and `ready` still surface the failure; this only stops an
+    // unobserved rejection from killing the process before a request arrives.
+    if (options.autoStart !== false) this.start().catch(() => {});
+  }
+
+  /** Initializes the wrapped adapter. Idempotent, and rejects loudly on failure. */
+  start(): Promise<void> {
+    this.starting ??= this.initialize();
+    return this.starting;
+  }
+
+  private async initialize(): Promise<void> {
+    try {
+      await this.adapter.initialize(this.chat);
+      this.options.onReady?.();
+    } catch (error) {
+      this.options.onError?.(error, { phase: "initialize" });
+      throw error;
+    }
+  }
+
+  /** Closes the adapter's connection and stops serving. Wire this to SIGTERM. */
+  async stop(): Promise<void> {
+    this.stopped = true;
+    try {
+      await this.adapter.disconnect?.();
+    } catch (error) {
+      this.options.onError?.(error, { phase: "shutdown" });
+      throw error;
+    }
   }
 
   /** Resolves once the wrapped adapter's own initialize() has completed. */
   get ready(): Promise<void> {
-    return this.initialized;
+    return this.start();
+  }
+
+  /**
+   * Entry point for adapters driven by platform webhooks rather than a socket.
+   * Mount alongside handleRequest; it waits for startup so an early delivery
+   * cannot reach a half-initialized adapter.
+   */
+  async handlePlatformWebhook(
+    request: Request,
+    options?: WebhookOptions,
+  ): Promise<Response> {
+    await this.start();
+    return this.adapter.handleWebhook(request, options);
   }
 
   async handleRequest(request: Request): Promise<Response> {
@@ -78,6 +134,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
         RpcErrorCode.INVALID_REQUEST,
         "Outbound calls must carry an id",
       );
+    }
+    if (this.stopped) {
+      return failure(id, RpcErrorCode.INTERNAL_ERROR, "Host is stopped");
     }
 
     const call = OUTBOUND_CALLS.safeParse({
@@ -94,9 +153,10 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
 
     try {
-      await this.initialized;
+      await this.start();
       return success(id, await encode(await this.dispatch(call.data)));
     } catch (error) {
+      this.options.onError?.(error, { phase: "dispatch" });
       const wire = serializeError(error);
       return failure(id, wire.code, wire.message, wire.data);
     }

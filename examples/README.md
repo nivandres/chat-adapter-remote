@@ -28,7 +28,7 @@ Session credentials are saved to `./examples/.baileys-auth` after the first succ
 
 ## Known gaps
 
-Plain text messages fit the v1 bridge: `BaileysAdapter.initialize()` only calls `getLogger`, and inbound text routes through `processMessage`, both bridged. Two operations are not bridged in v1 and throw `RemoteChatUnsupportedMethodError` if triggered:
+Plain text messages fit the bridge: `BaileysAdapter.initialize()` only calls `getLogger`, and inbound text routes through `processMessage`, both bridged. Two operations are not bridged. They no longer crash the host — the call is logged and ignored — but the feature silently does nothing:
 
 - Reacting to a message — the adapter calls `chat.processReaction(...)`.
 - Voting in a poll — the adapter calls `chat.getState()` for decryption-state persistence.

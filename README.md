@@ -10,7 +10,9 @@ Some platforms (WhatsApp via Baileys, for example) need a persistent, continuous
 npm i chat-adapter-remote
 ```
 
-Peer dependencies: `chat@^4.40.0` and `@chat-adapter/shared@^4.40.0`. Node >= 20. ESM only.
+Peer dependencies: `chat@^4.40.0` and `@chat-adapter/shared@^4.40.0`. ESM only.
+
+Both sides require Node >= 20 or Bun. Signing uses `node:crypto` and the codec uses `Buffer`, so the consumer does **not** currently run on edge runtimes (Cloudflare Workers, Vercel Edge) without a Node compatibility layer.
 
 `@chat-adapter/shared` is a peer, not a bundled dependency, on purpose: adapter errors are reconstructed across the boundary with `instanceof`, which only works when both sides resolve the same copy of those error classes.
 
@@ -53,6 +55,38 @@ chat.onNewMention(async (thread) => {
 ```
 
 Register the adapter under the same key as its `name`, since Chat derives state keys from one and routes webhooks by the other.
+
+## Host lifecycle
+
+`serveAdapter` initializes during construction, so the one-liner above keeps working. For explicit control — and to see a failed connection loudly rather than through an object that silently never works — use `start()` and `stop()`:
+
+```ts
+const host = serveAdapter(adapter, {
+  secret,
+  consumerUrl,
+  autoStart: false,
+  onReady: () => console.log("connected"),
+  onError: (error, { phase, threadId }) => report(error, { phase, threadId }),
+  logForwardLevel: "warn",
+  maxConcurrentForwards: 16,
+});
+
+await host.start(); // rejects if the adapter fails to connect
+process.on("SIGTERM", () => host.stop());
+```
+
+`start()` is idempotent and returns the same promise however often it is called; `ready` is a shorthand for it. `onError` fires for the `initialize`, `forward`, `dispatch`, and `shutdown` phases. `maxConcurrentForwards` caps how many inbound messages are in flight to the consumer at once, so a backlog of queued platform messages cannot open one request each.
+
+## Webhook-driven adapters
+
+Adapters driven by platform webhooks rather than a socket need a second route on the host. `handlePlatformWebhook` waits for startup first, so an early delivery cannot reach a half-initialized adapter:
+
+```ts
+app.post("/rpc", (req) => host.handleRequest(req)); // from the consumer
+app.post("/slack", (req) => host.handlePlatformWebhook(req)); // from the platform
+```
+
+Inbound events still reach the consumer through the same bridged `processMessage`, so only `processMessage`-driven adapters work end to end — see the matrix below.
 
 ## Capability matrix
 

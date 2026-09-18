@@ -9,8 +9,21 @@ import { ConsoleLogger } from "chat";
 
 import { serializeMessage } from "../rpc/message-wire";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
-import { createBridgingLogger } from "./logger-bridge";
+import { createBridgingLogger, type LogLevel } from "./logger-bridge";
 import type { FetchLike } from "../types";
+
+/** Where a failure happened, so callers can route it without parsing messages. */
+export type HostErrorPhase = "initialize" | "forward" | "dispatch" | "shutdown";
+
+export interface HostErrorContext {
+  phase: HostErrorPhase;
+  threadId?: string;
+}
+
+export type HostErrorHandler = (
+  error: unknown,
+  context: HostErrorContext,
+) => void;
 
 export interface RemoteChatOptions {
   consumerUrl: string;
@@ -18,16 +31,41 @@ export interface RemoteChatOptions {
   timeoutMs?: number;
   logger?: Logger;
   fetch?: FetchLike;
+  onError?: HostErrorHandler;
+  /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
+  logForwardLevel?: LogLevel;
+  /** Inbound messages forwarded at once. Default 8. */
+  maxConcurrentForwards?: number;
+}
+
+/** Caps concurrent tasks so a burst cannot open one request per message. */
+function createLimiter(limit: number) {
+  const waiting: Array<() => void> = [];
+  let active = 0;
+
+  return async function run<T>(task: () => Promise<T>): Promise<T> {
+    if (active >= limit)
+      await new Promise<void>((resolve) => waiting.push(resolve));
+    active++;
+    try {
+      return await task();
+    } finally {
+      active--;
+      waiting.shift()?.();
+    }
+  };
 }
 
 class RemoteChat {
   readonly logger: Logger;
   private readonly rpc: RpcClient;
   private readonly warned = new Set<string>();
+  private readonly limit: <T>(task: () => Promise<T>) => Promise<T>;
 
-  constructor(options: RemoteChatOptions) {
+  constructor(private readonly options: RemoteChatOptions) {
     this.logger =
       options.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
+    this.limit = createLimiter(options.maxConcurrentForwards ?? 8);
     this.rpc = createRpcClient({
       url: options.consumerUrl,
       secret: options.secret,
@@ -56,17 +94,20 @@ class RemoteChat {
           { attachment, error },
         ),
       );
-      await this.rpc.request("processMessage", [
-        threadId,
-        wire,
-        adapter.channelIdFromThreadId(threadId),
-        adapter.isDM?.(threadId),
-      ]);
+      await this.limit(() =>
+        this.rpc.request("processMessage", [
+          threadId,
+          wire,
+          adapter.channelIdFromThreadId(threadId),
+          adapter.isDM?.(threadId),
+        ]),
+      );
     } catch (error) {
       this.logger.error("failed to deliver message to consumer", {
         threadId,
         error,
       });
+      this.options.onError?.(error, { phase: "forward", threadId });
     }
   }
 
@@ -74,6 +115,7 @@ class RemoteChat {
     return createBridgingLogger({
       prefix,
       localLogger: prefix ? this.logger.child(prefix) : this.logger,
+      forwardLevel: this.options.logForwardLevel,
       notify: (level, pfx, message, args) =>
         this.rpc.notify("log", [level, pfx, message, args]),
     });

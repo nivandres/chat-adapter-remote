@@ -16,6 +16,11 @@ Correctness release following a review against real adapter objects. Anyone on 0
 
 ### Added
 
+- `AdapterHost.start()` and `AdapterHost.stop()`, with `autoStart` to opt out of initializing during construction. `start()` is idempotent and rejects loudly; `ready` is now shorthand for it. `stop()` disconnects the adapter and refuses further dispatch, so it can be wired to `SIGTERM`.
+- `AdapterHost.handlePlatformWebhook()`, so adapters driven by platform webhooks rather than a socket have a host-side route that waits for startup first.
+- `onError` and `onReady` callbacks on `serveAdapter`. `onError` reports the `initialize`, `forward`, `dispatch`, and `shutdown` phases.
+- `maxConcurrentForwards` (default 8) caps inbound messages in flight to the consumer, so a platform backlog cannot open one request per message.
+- `logForwardLevel` on `serveAdapter`, forwarding the log threshold through to the bridged logger.
 - `protocolVersion` in the handshake; both sides refuse to initialize on a mismatch.
 - `lockScope`, `persistThreadHistory`, and `supportsTurnCancellation` carried over the handshake.
 - `isDM` bridged per inbound message, so DM routing reaches `onNewMention` without a literal mention.
@@ -32,7 +37,11 @@ Correctness release following a review against real adapter objects. Anyone on 0
 - Response ids are matched against request ids, and the id counter is per client.
 - `RpcErrorCode.REPLAY_REJECTED` renamed to `STALE_TIMESTAMP`, matching what the check actually does.
 - `engines.node >= 20`, `sideEffects: false`, and a `prepublishOnly` guard added.
+- Signing imports `node:crypto` rather than the bare `crypto` specifier, so bundlers stop attempting a browser polyfill.
 
 ## 0.1.0
 
 Initial release.
+
+[0.2.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/nivandres/chat-adapter-remote/releases/tag/v0.1.0

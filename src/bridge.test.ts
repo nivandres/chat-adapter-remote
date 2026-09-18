@@ -426,3 +426,85 @@ describe("request verification", () => {
     expect(b.adapter.postMessage).not.toHaveBeenCalled();
   });
 });
+
+describe("bridged paths", () => {
+  it("accepts the lazy message factory form adapters actually use", async () => {
+    const b = bridge();
+    await b.host.ready;
+    const delivered = deferred<Message>();
+    b.chat.onNewMention(async (_thread, received) =>
+      delivered.resolve(received),
+    );
+
+    await b
+      .hostChat()
+      .processMessage(b.adapter, "mock:general:1", async () =>
+        message("@mock-bot from a factory"),
+      );
+
+    expect((await delivered.promise).text).toBe("@mock-bot from a factory");
+  });
+
+  it("forwards host log lines to the consumer's logger", async () => {
+    const b = bridge();
+    await b.host.ready;
+    const forwarded = deferred<string>();
+    vi.spyOn(b.chat, "getLogger").mockReturnValue({
+      debug: vi.fn(),
+      info: (line: string) => forwarded.resolve(line),
+      warn: vi.fn(),
+      error: vi.fn(),
+      child: vi.fn(),
+    } as never);
+
+    b.hostChat().getLogger("socket").info("connection opened");
+
+    expect(await forwarded.promise).toBe("connection opened");
+  });
+
+  it("throws from the synchronous members core never calls", async () => {
+    const b = bridge();
+    await b.host.ready;
+
+    expect(() => b.remote.encodeThreadId()).toThrow(/synchronous/);
+    expect(() => b.remote.decodeThreadId()).toThrow(/synchronous/);
+    expect(() => b.remote.renderFormatted({} as never)).toThrow(/synchronous/);
+    expect(() => b.remote.parseMessage()).toThrow(/synchronous/);
+  });
+
+  it("caps how many requests it has in flight to the consumer at once", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const counting: FetchLike = async (_url, init) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      return Response.json({
+        jsonrpc: "2.0",
+        id: JSON.parse(String(init?.body)).id,
+        result: null,
+      });
+    };
+
+    const hostChat = createRemoteChat({
+      consumerUrl: CONSUMER_URL,
+      secret: SECRET,
+      fetch: counting,
+      maxConcurrentForwards: 4,
+    });
+    const adapter = createMockAdapter("mock");
+
+    await Promise.all(
+      Array.from({ length: 30 }, (_, index) =>
+        hostChat.processMessage(
+          adapter,
+          "mock:general:1",
+          message(`m${index}`),
+        ),
+      ),
+    );
+
+    expect(peak).toBe(4);
+  });
+});
