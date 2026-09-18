@@ -88,21 +88,21 @@ Read when the matching option is not passed.
 
 `serveAdapter(adapter, options)` / `createAdapterHost(adapter, options)` — the host:
 
-| Field                                                                                 | Type                                   | Default  | Description                                              |
-| ------------------------------------------------------------------------------------- | -------------------------------------- | -------- | -------------------------------------------------------- |
-| `consumerUrl`                                                                         | `string`                               | env      | Where inbound events are delivered                       |
-| `secret`                                                                              | `string`                               | env      | Shared HMAC secret                                       |
-| `autoStart`                                                                           | `boolean`                              | `true`   | `createAdapterHost` always starts stopped                |
-| `inlineAttachments`                                                                   | `boolean \| "auto"`                    | `"auto"` | Inline attachment bytes, or keep them here to be fetched |
-| `attachmentTtlMs`                                                                     | `number`                               | `300000` | How long an unfetched attachment is kept                 |
-| `maxConcurrentForwards`                                                               | `number`                               | `8`      | Inbound messages in flight at once                       |
-| `maxQueuedForwards`                                                                   | `number`                               | `1000`   | Messages allowed to queue behind those                   |
-| `streamTtlMs`                                                                         | `number`                               | `300000` | Idle stream lifetime                                     |
-| `streamStartTimeoutMs`                                                                | `number`                               | `10000`  | How long the adapter may take to start streaming         |
-| `onReady`                                                                             | `() => void`                           | —        | Called once connected                                    |
-| `onError`                                                                             | `(error, { phase, threadId }) => void` | —        | `initialize`, `forward`, `dispatch`, `shutdown`          |
-| `logForwardLevel`                                                                     | `LogLevel`                             | `"info"` | Below this, logs stay on the host                        |
-| `timeoutMs`, `timestampToleranceMs`, `maxBodyBytes`, `replayGuard`, `logger`, `fetch` |                                        |          | As above                                                 |
+| Field                                                                                 | Type                                   | Default  | Description                                                                              |
+| ------------------------------------------------------------------------------------- | -------------------------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `consumerUrl`                                                                         | `string`                               | env      | Where inbound events are delivered                                                       |
+| `secret`                                                                              | `string`                               | env      | Shared HMAC secret                                                                       |
+| `autoStart`                                                                           | `boolean`                              | `true`   | `createAdapterHost` always starts stopped                                                |
+| `inlineAttachments`                                                                   | `boolean \| "auto"`                    | `"auto"` | `true` always inlines, `false` never does, `"auto"` inlines while the body budget allows |
+| `attachmentTtlMs`                                                                     | `number`                               | `300000` | How long an unfetched attachment is kept                                                 |
+| `maxConcurrentForwards`                                                               | `number`                               | `8`      | Inbound messages in flight at once                                                       |
+| `maxQueuedForwards`                                                                   | `number`                               | `1000`   | Messages allowed to queue behind those                                                   |
+| `streamTtlMs`                                                                         | `number`                               | `300000` | Idle stream lifetime                                                                     |
+| `streamStartTimeoutMs`                                                                | `number`                               | `10000`  | How long the adapter may take to start streaming                                         |
+| `onReady`                                                                             | `() => void`                           | —        | Called once connected                                                                    |
+| `onError`                                                                             | `(error, { phase, threadId }) => void` | —        | `initialize`, `forward`, `dispatch`, `shutdown`                                          |
+| `logForwardLevel`                                                                     | `LogLevel`                             | `"info"` | Below this, logs stay on the host                                                        |
+| `timeoutMs`, `timestampToleranceMs`, `maxBodyBytes`, `replayGuard`, `logger`, `fetch` |                                        |          | As above                                                                                 |
 
 ## Lifecycle
 

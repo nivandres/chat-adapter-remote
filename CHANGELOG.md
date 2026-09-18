@@ -6,7 +6,7 @@ Attachment bytes no longer have to travel inside the message. Both sides must be
 
 ### Added
 
-- `inlineAttachments`, defaulting to `"auto"`. Small media still travels inside the message; once it would not fit the body budget the host keeps the bytes and sends an id, and the consumer's `fetchData()` pulls them when a handler actually reads the attachment. When the platform reported a size, an oversized attachment is never even downloaded on the host. `true` and `false` force either behaviour. Nothing here is adapter-specific — the host holds whatever the adapter already knew how to do, so it works for adapters that implement neither `rehydrateAttachment` nor `fetchMetadata`.
+- `inlineAttachments`, defaulting to `"auto"`. Small media still travels inside the message; once it would not fit the body budget the host keeps the bytes and sends an id, and the consumer's `fetchData()` pulls them when a handler actually reads the attachment. When the platform reported a size, an oversized attachment is never even downloaded on the host. `true` always inlines, `false` never does. When the adapter implements `rehydrateAttachment` and the attachment carries `fetchMetadata`, deferring uses that instead and nothing is held here — it survives a host restart and never expires. Nothing here is adapter-specific — the host holds whatever the adapter already knew how to do, so it works for adapters that implement neither `rehydrateAttachment` nor `fetchMetadata`.
 - `attachmentTtlMs`, how long bytes the consumer never fetched are kept.
 - `url` and `secret` fall back to `CHAT_ADAPTER_REMOTE_URL`, `CHAT_ADAPTER_REMOTE_CONSUMER_URL` and `CHAT_ADAPTER_REMOTE_SECRET`, and a missing one now throws `ValidationError` from `@chat-adapter/shared` rather than a plain `Error`.
 
