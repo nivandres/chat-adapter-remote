@@ -14,6 +14,7 @@ import type {
   StreamOptions,
   WebhookOptions,
 } from "chat";
+import { ValidationError } from "@chat-adapter/shared";
 import { ConsoleLogger } from "chat";
 
 import { decode, encode } from "../rpc/codec";
@@ -23,7 +24,11 @@ import {
   RpcErrorCode,
   serializeError,
 } from "../rpc/errors";
-import { deserializeMessage, serializeMessage } from "../rpc/message-wire";
+import {
+  deserializeMessage,
+  serializeMessage,
+  type AttachmentPolicy,
+} from "../rpc/message-wire";
 import {
   OPTIONAL_CAPABILITIES,
   OUTBOUND_CALLS,
@@ -34,6 +39,11 @@ import { createReplayGuard } from "../rpc/security";
 import type { FetchLike } from "../types";
 import type { LogLevel } from "./logger-bridge";
 import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
+import {
+  AttachmentBudget,
+  AttachmentRegistry,
+  type InlineAttachments,
+} from "./attachments";
 import { StreamRegistry } from "./streams";
 
 export interface ServeAdapterOptions extends DispatchOptions {
@@ -58,11 +68,26 @@ export interface ServeAdapterOptions extends DispatchOptions {
   streamTtlMs?: number;
   /** How long the adapter may take to start streaming. Default 10 seconds. */
   streamStartTimeoutMs?: number;
+  /**
+   * Whether attachment bytes travel inside the message. Default `"auto"`,
+   * which inlines them while the body budget allows and otherwise leaves them
+   * here for the consumer to fetch by id.
+   */
+  inlineAttachments?: InlineAttachments;
+  /** How long an attachment the consumer never fetched is kept. Default 5 minutes. */
+  attachmentTtlMs?: number;
 }
 
 /** Both are deployment mistakes: failing here beats failing on the first request. */
-function requireOption(value: string | undefined, option: string): void {
-  if (!value) throw new Error(`chat-adapter-remote: "${option}" is required`);
+function requireOption(value: string | undefined, option: string): string {
+  if (!value) {
+    const variable = option === "secret" ? "SECRET" : "CONSUMER_URL";
+    throw new ValidationError(
+      "remote",
+      `"${option}" is required; pass it or set CHAT_ADAPTER_REMOTE_${variable}`,
+    );
+  }
+  return value;
 }
 
 function success(id: string | number, result: unknown): Response {
@@ -90,6 +115,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private readonly dispatchOptions: DispatchOptions;
   private readonly capabilities: OptionalCapability[];
   private readonly streams: StreamRegistry;
+  private readonly attachments: AttachmentRegistry;
   private readonly scheduled = new Map<string, ScheduledMessage<TRawMessage>>();
   private starting?: Promise<void>;
   private stopped = false;
@@ -98,13 +124,20 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     private readonly adapter: Adapter<TThreadId, TRawMessage>,
     private readonly options: ServeAdapterOptions,
   ) {
-    requireOption(options.consumerUrl, "consumerUrl");
-    requireOption(options.secret, "secret");
+    const consumerUrl = requireOption(
+      options.consumerUrl ?? process.env.CHAT_ADAPTER_REMOTE_CONSUMER_URL,
+      "consumerUrl",
+    );
+    const secret = requireOption(
+      options.secret ?? process.env.CHAT_ADAPTER_REMOTE_SECRET,
+      "secret",
+    );
     this.logger =
       options.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
 
     this.dispatchOptions = {
       ...options,
+      secret,
       replayGuard: options.replayGuard ?? createReplayGuard(),
     };
     this.capabilities = OPTIONAL_CAPABILITIES.filter(
@@ -114,15 +147,19 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       ttlMs: options.streamTtlMs,
       startTimeoutMs: options.streamStartTimeoutMs,
     });
+    this.attachments = new AttachmentRegistry(
+      options.attachmentTtlMs ?? 300_000,
+    );
 
     this.chat = createRemoteChat({
-      consumerUrl: options.consumerUrl,
-      secret: options.secret,
+      consumerUrl,
+      secret,
       timeoutMs: options.timeoutMs,
       logger: this.logger,
       fetch: options.fetch,
       onError: options.onError,
       userName: adapter.userName,
+      attachments: () => this.attachmentPolicy(),
       logForwardLevel: options.logForwardLevel,
       maxConcurrentForwards: options.maxConcurrentForwards,
       maxQueuedForwards: options.maxQueuedForwards,
@@ -154,6 +191,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     this.stopped = true;
     this.streams.clear();
     this.scheduled.clear();
+    this.attachments.clear();
     try {
       await this.adapter.disconnect?.();
     } catch (error) {
@@ -231,6 +269,17 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
   }
 
+  /** A fresh budget per message, since the limit is on one body. */
+  private attachmentPolicy(): AttachmentPolicy {
+    return {
+      budget: new AttachmentBudget(
+        this.options.inlineAttachments ?? "auto",
+        this.options.maxBodyBytes ?? 5_000_000,
+      ),
+      registry: this.attachments,
+    };
+  }
+
   /** Bound accessor for an optional member the wrapped adapter may not have. */
   private required<K extends OptionalCapability>(
     name: K,
@@ -260,6 +309,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
           protocolVersion: PROTOCOL_VERSION,
           name: adapter.name,
           userName: adapter.userName,
+          attachments: () => this.attachmentPolicy(),
           botUserId: adapter.botUserId,
           lockScope: adapter.lockScope,
           persistThreadHistory:
@@ -371,7 +421,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
           first,
           params[1] as string,
         );
-        return message ? serializeMessage(message as Message) : null;
+        return message
+          ? serializeMessage(message as Message, this.attachmentPolicy())
+          : null;
       }
       case "fetchChannelInfo":
         return this.required("fetchChannelInfo")(first);
@@ -421,6 +473,16 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
         this.scheduled.delete(first);
         return scheduled.cancel();
       }
+      case "fetchAttachment": {
+        const bytes = this.attachments.read(first);
+        if (!bytes) {
+          throw new RemoteAdapterRpcError(
+            RpcErrorCode.STREAM_NOT_FOUND,
+            `chat-adapter-remote: attachment ${first} is unknown or has expired`,
+          );
+        }
+        return bytes;
+      }
       case "rehydrateAttachment": {
         const rebuilt = this.required("rehydrateAttachment")(
           params[0] as Attachment,
@@ -463,7 +525,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     return {
       ...result,
       messages: await Promise.all(
-        result.messages.map((message) => serializeMessage(message as Message)),
+        result.messages.map((message) =>
+          serializeMessage(message as Message, this.attachmentPolicy()),
+        ),
       ),
     };
   }
@@ -476,7 +540,10 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       threads: await Promise.all(
         result.threads.map(async (thread) => ({
           ...thread,
-          rootMessage: await serializeMessage(thread.rootMessage as Message),
+          rootMessage: await serializeMessage(
+            thread.rootMessage as Message,
+            this.attachmentPolicy(),
+          ),
         })),
       ),
     };

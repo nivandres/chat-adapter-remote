@@ -27,6 +27,7 @@ import type {
   UserInfo,
   WebhookOptions,
 } from "chat";
+import { ValidationError } from "@chat-adapter/shared";
 import { ConsoleLogger, getEmoji } from "chat";
 
 import { decode, encode } from "./rpc/codec";
@@ -71,8 +72,15 @@ type InboundEvent = Exclude<
  * would mean dropping every message; both are deployment mistakes worth
  * failing on at startup rather than on the first request.
  */
-function requireOption(value: string | undefined, option: string): void {
-  if (!value) throw new Error(`chat-adapter-remote: "${option}" is required`);
+function requireOption(value: string | undefined, option: string): string {
+  if (!value) {
+    const variable = option === "url" ? "URL" : "SECRET";
+    throw new ValidationError(
+      "remote",
+      `"${option}" is required; pass it or set CHAT_ADAPTER_REMOTE_${variable}`,
+    );
+  }
+  return value;
 }
 
 /** Either the host is consuming, or it already finished without reading. */
@@ -106,12 +114,19 @@ export class RemoteAdapter<
   private readonly rpc: RpcClient;
   private readonly logger: Logger;
   private readonly replayGuard: ReplayGuard;
+  private readonly secret: string;
   private readonly threads = new Map<string, ThreadFacts>();
   private readonly maxCachedThreads: number;
 
   constructor(private readonly config: RemoteAdapterConfig) {
-    requireOption(config.url, "url");
-    requireOption(config.secret, "secret");
+    const url = requireOption(
+      config.url ?? process.env.CHAT_ADAPTER_REMOTE_URL,
+      "url",
+    );
+    this.secret = requireOption(
+      config.secret ?? process.env.CHAT_ADAPTER_REMOTE_SECRET,
+      "secret",
+    );
     this.name = config.name ?? "remote";
     this.userName = config.userName ?? this.name;
     this.logger =
@@ -119,8 +134,8 @@ export class RemoteAdapter<
     this.maxCachedThreads = config.maxCachedThreads ?? DEFAULT_THREAD_CACHE;
     this.replayGuard = config.replayGuard ?? createReplayGuard();
     this.rpc = createRpcClient({
-      url: config.url,
-      secret: config.secret,
+      url,
+      secret: this.secret,
       timeoutMs: config.timeoutMs,
       fetch: config.fetch,
     });
@@ -269,6 +284,14 @@ export class RemoteAdapter<
     ]);
   }
 
+  /** Rebuilds a message, wiring any attachment the host kept back to a fetch. */
+  private rebuild(wire: unknown): Message {
+    return deserializeMessage(
+      wire,
+      (id) => this.rpc.request("fetchAttachment", [id]) as Promise<Buffer>,
+    );
+  }
+
   private toFetchResult(result: unknown): FetchResult<TRawMessage> {
     const { messages, nextCursor } = result as {
       messages: unknown[];
@@ -276,7 +299,7 @@ export class RemoteAdapter<
     };
     return {
       messages: messages.map(
-        (wire) => deserializeMessage(wire) as Message<TRawMessage>,
+        (wire) => this.rebuild(wire) as Message<TRawMessage>,
       ),
       nextCursor,
     };
@@ -296,7 +319,7 @@ export class RemoteAdapter<
     messageId: string,
   ): Promise<Message<TRawMessage> | null> {
     const wire = await this.rpc.request("fetchMessage", [threadId, messageId]);
-    return wire ? (deserializeMessage(wire) as Message<TRawMessage>) : null;
+    return wire ? (this.rebuild(wire) as Message<TRawMessage>) : null;
   }
 
   async fetchThread(threadId: string): Promise<ThreadInfo> {
@@ -346,7 +369,7 @@ export class RemoteAdapter<
     return {
       threads: result.threads.map((thread) => ({
         ...thread,
-        rootMessage: deserializeMessage(thread.rootMessage),
+        rootMessage: this.rebuild(thread.rootMessage),
       })) as ListThreadsResult<TRawMessage>["threads"],
       nextCursor: result.nextCursor,
     };
@@ -565,7 +588,7 @@ export class RemoteAdapter<
     options?: WebhookOptions,
   ): Promise<Response> {
     const verified = await verifyRequest(request, {
-      secret: this.config.secret,
+      secret: this.secret,
       timestampToleranceMs: this.config.timestampToleranceMs,
       maxBodyBytes: this.config.maxBodyBytes,
       replayGuard: this.replayGuard,
@@ -656,7 +679,7 @@ export class RemoteAdapter<
       adapter: this,
     };
     for (const key of EVENT_MESSAGE_KEYS) {
-      if (restored[key]) restored[key] = deserializeMessage(restored[key]);
+      if (restored[key]) restored[key] = this.rebuild(restored[key]);
     }
     if (typeof restored.emoji === "string")
       restored.emoji = getEmoji(restored.emoji);
@@ -678,12 +701,7 @@ export class RemoteAdapter<
             ChannelVisibility | undefined,
         });
         this.detach(
-          chat.processMessage(
-            this,
-            threadId,
-            deserializeMessage(wire),
-            options,
-          ),
+          chat.processMessage(this, threadId, this.rebuild(wire), options),
           call.method,
         );
         return;

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 const ThreadId = z.string();
 const MessageId = z.string();
@@ -286,6 +286,13 @@ export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
   z
     .object({
       method: z.literal("cancelScheduledMessage"),
+      id: Id,
+      params: z.tuple([z.string()]),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal("fetchAttachment"),
       id: Id,
       params: z.tuple([z.string()]),
     })

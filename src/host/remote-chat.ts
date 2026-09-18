@@ -8,7 +8,7 @@ import type {
 } from "chat";
 import { ConsoleLogger } from "chat";
 
-import { serializeMessage } from "../rpc/message-wire";
+import { serializeMessage, type AttachmentPolicy } from "../rpc/message-wire";
 import { EVENT_MESSAGE_KEYS } from "../rpc/methods";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
 import { createBridgingLogger, type LogLevel } from "./logger-bridge";
@@ -36,6 +36,8 @@ export interface RemoteChatOptions {
   onError?: HostErrorHandler;
   /** Answers `getUserName()`, which cannot be asked of the consumer synchronously. */
   userName?: string;
+  /** Builds the per-message attachment policy. */
+  attachments?: () => AttachmentPolicy;
   /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
@@ -131,7 +133,11 @@ class RemoteChat {
 
     for (const key of EVENT_MESSAGE_KEYS) {
       const message = await this.resolveMessage(wire[key]);
-      if (message) wire[key] = await serializeMessage(message);
+      if (message)
+        wire[key] = await serializeMessage(
+          message,
+          this.options.attachments?.(),
+        );
       else delete wire[key];
     }
     // EmojiValue.toJSON() gives a placeholder, not the name the consumer needs.
@@ -192,11 +198,14 @@ class RemoteChat {
   ): Promise<void> {
     try {
       const resolved = (await this.resolveMessage(message))!;
-      const wire = await serializeMessage(resolved, (attachment, error) =>
-        this.logger.warn(
-          "attachment data unavailable, forwarding metadata only",
-          { attachment, error },
-        ),
+      const wire = await serializeMessage(
+        resolved,
+        this.options.attachments?.(),
+        (attachment, error) =>
+          this.logger.warn(
+            "attachment data unavailable, forwarding metadata only",
+            { attachment, error },
+          ),
       );
       await this.forward(
         "processMessage",
