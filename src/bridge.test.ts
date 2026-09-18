@@ -346,8 +346,9 @@ describe("failure containment", () => {
       fetch: vi.fn(),
     });
 
-    expect(() => chat.getState()).not.toThrow();
-    expect(() => chat.processOptionsLoad({} as never)).not.toThrow();
+    expect(() =>
+      chat.handleIncomingMessage({} as never, "t", {} as never),
+    ).not.toThrow();
     expect(warn).toHaveBeenCalled();
   });
 
