@@ -57,7 +57,7 @@ async function main() {
   const server = Bun.serve({
     port: HOST_PORT,
     hostname: "127.0.0.1",
-    fetch: (request) => host.handleRequest(request),
+    fetch: host.fetch,
   });
   console.log(
     `Host listening on http://${server.hostname}:${server.port} — waiting for QR scan / reconnect...`,
