@@ -8,7 +8,7 @@ Some platforms — WhatsApp via Baileys, for example — need a process that hol
 npm i chat-adapter-remote
 ```
 
-ESM only, Node >= 20 or Bun. Peers: `chat` and `@chat-adapter/shared`. The second is a peer because adapter errors are rebuilt as their original class across the boundary, so `instanceof` in your handlers only works against the same copy you have. Install both at matching versions — `@chat-adapter/shared` pins `chat` exactly, so a version split there quietly gives you two copies of `chat` as well.
+ESM only, Node >= 20 or Bun. Peers: `chat` and `@chat-adapter/shared`, which must be installed at matching versions.
 
 ## Host
 
@@ -74,45 +74,32 @@ process.on("SIGTERM", () => host.stop());
 
 ## What crosses the bridge
 
-**Outbound** (into the real adapter) is the whole `Adapter` interface except its four synchronous members — `encodeThreadId`, `decodeThreadId`, `renderFormatted`, `parseMessage` — which cannot be answered over RPC and which Chat core never calls on an adapter it holds. They throw if you call them yourself.
+**Outbound** is the whole `Adapter` interface except four synchronous members — `encodeThreadId`, `decodeThreadId`, `renderFormatted`, `parseMessage` — which cannot be answered over a round trip. They throw if you call them.
 
-Two members return live values, so each keeps its object on the host and is reached by id: `scheduleMessage` returns a `cancel()` that calls back, and `rehydrateAttachment` returns a `fetchData()` that fetches the bytes through the host.
+**Inbound** is every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modals, options load, agent-session, assistant and app-home events, and turn cancellation. `getState`, `history` and `transcripts` are not bridged and resolve to a logged no-op.
 
-**Inbound** (into the real `Chat`) covers every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modal submit and close, options load, agent-session, assistant and app-home events, turn cancellation, and log forwarding. `processModalSubmit` and `processOptionsLoad` are awaited rather than acknowledged, because the platform is waiting on their answer.
+The host reports which optional members its adapter actually implements, and the consumer removes the rest, so Chat's own fallbacks still apply to anything the real adapter never had.
 
-What is left is `getState`, `history` and `transcripts`, which hand back live objects rather than data. Those resolve to a logged no-op rather than throwing, because adapters call them from inside their own event loops where a throw would kill the host process.
-
-`npm run support-map` prints the current list, derived from the protocol so it cannot drift.
-
-The host reports which optional members its adapter actually implements, and the consumer removes the rest from itself. Chat decides what an adapter can do with `adapter.method?.()`, so a method the real adapter never had stays absent and its built-in fallback still applies.
-
-`isDM`, `channelIdFromThreadId`, and `getChannelVisibility` are synchronous, so they are answered from facts the host attaches to each inbound message and caches per thread. A thread the consumer has not seen falls back to the SDK defaults.
+`isDM`, `channelIdFromThreadId` and `getChannelVisibility` are answered from facts the host sends with each message. A thread the consumer has not seen yet falls back to the SDK defaults.
 
 ## Streaming
 
-`stream` takes an AsyncIterable, which cannot be an RPC argument, so it becomes open/push/end. One push is in flight at a time: the first chunk leaves immediately and whatever arrives while it travels goes out together, so batching follows the round trip and a pause in the producer never holds buffered chunks back.
-
-When the host's adapter declines to stream — returning `null` before reading anything, which is how it hands back to Chat SDK's post-and-edit fallback — the host says so when the stream is opened and the consumer returns without touching the caller's iterable, because that fallback re-reads it.
+Adapters with native streaming get it. When the host's adapter declines to stream, Chat's own post-and-edit fallback takes over as usual.
 
 ## Delivery
 
-At-most-once. No retry, queue, or deduplication: a failed forward is logged and dropped. An acknowledgement means "received", not "handled".
+At-most-once: a failed forward is logged and dropped, and an acknowledgement means "received", not "handled".
 
-Chat core serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers. That is core behavior rather than the bridge — distinct threads all run — but it matters here because a host draining a backlog after a reconnect sends exactly that shape of burst. Set a `queue` concurrency strategy on the consumer's `Chat` if you need every message.
+Chat serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers — set a `queue` concurrency strategy on the consumer's `Chat` if you need every message. This matters here because a host draining a backlog after a reconnect sends exactly that shape of burst.
 
-Attachment bytes are inlined as base64, so the effective media ceiling is `maxBodyBytes` divided by about 1.33. The 5 MB default is ours, chosen as a memory guard rather than a protocol limit — the body is buffered before dispatch, so the real cost is that much RAM per concurrent request. Raise it on **both** sides, since each has its own option; raising only one gives a confusing 413. Your host may cap request bodies below whatever you set, so check it before tuning.
-
-For media past that, point at it instead of inlining it: an attachment with a `url` is fetched by the platform directly and never touches the bridge. Inbound never inlines — the host sends metadata and the consumer rebuilds a `fetchData()` that pulls the bytes on demand, one round trip per attachment.
-
-Inbound methods are additive: a newer host may send an event an older consumer does not know, which is answered with a validation error and logged on both sides rather than dropping the connection. The protocol version only changes when the shape of an existing call does, and a mismatch there refuses to initialize.
+Attachments are inlined as base64 and bounded by `maxBodyBytes` (5 MB default), which has to be raised on **both** sides. For anything larger, give the attachment a `url` instead: the platform fetches it directly and it never crosses the bridge.
 
 ## Security
 
 - Every request in both directions is HMAC-SHA256 signed over the raw body and compared in constant time.
-- Signed timestamps outside a tolerance window are rejected, and each signature is accepted only once inside it. The default replay store is per-process and bounded; pass a `replayGuard` — `seen()` may be async — to share one across instances.
-- Bodies are rejected past `maxBodyBytes` while being read, before they are buffered.
-- Dispatch is a closed Zod allowlist of method literals. Neither side is ever indexed with a string from the wire.
-- Adapter errors map to fixed codes and are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
+- Signatures are single-use inside a tolerance window. The default replay store is per-process; pass a `replayGuard` — `seen()` may be async — to share one across instances.
+- Bodies are rejected past `maxBodyBytes` while being read.
+- Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
 - One shared secret covers both directions, with no key id or rotation path. A leaked secret grants full send-as-the-bot access.
 
 ## Limits
