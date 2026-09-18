@@ -2,7 +2,7 @@
 
 ## 0.2.0
 
-Correctness release following a review against real adapter objects. Anyone on 0.1.0 should upgrade; the bugs below cause silent message loss, corrupted data, and host crashes.
+A correctness pass against real adapter objects, plus an expansion of the bridged surface to almost all of the `Adapter` interface. Anyone on 0.1.0 should upgrade; the bugs below cause silent message loss, corrupted data, and host crashes. The handshake now carries a protocol version, so both sides must be upgraded together.
 
 ### Fixed
 
@@ -13,11 +13,23 @@ Correctness release following a review against real adapter objects. Anyone on 0
 - Unbridged `ChatInstance` members threw into adapter event loops, so a single WhatsApp reaction or poll vote killed the host. They now log and no-op.
 - The codec rejected any object referenced twice as a sibling, treating shared references as cycles. Cycle detection now tracks the ancestor path.
 - A dispatch returning `undefined` produced a response with no `result` member, which the client then rejected.
+- The consumer's per-thread facts cache grew for the lifetime of the process. It is now bounded by `maxCachedThreads` (default 1000), oldest evicted first.
+- `createAdapterHost` could be made to start after all, because `autoStart` from the caller's options overrode it.
 
 ### Added
 
+- Capability handshake. The host reports which optional `Adapter` members its adapter actually implements and the consumer removes the rest from itself, so Chat's `adapter.method?.()` fallbacks keep working instead of failing against a method the real adapter never had.
+- Bridged `reply`, `endTyping`, `markAsRead`, `listThreads`, `getUser`, `postObject`, `editObject`, `openDM`, `openModal`, `postEphemeral`, `postChannelMessage`, `fetchMessage`, `fetchChannelInfo`, `fetchChannelMessages`, `fetchSubject`, and `onThreadSubscribe`. Every return value carrying a `Message` goes through the message codec, so dates and attachments survive.
+- Bridged `stream`, as an open/push/end call sequence that rebuilds the async iterable on the host. One push is in flight at a time, so the first chunk leaves immediately and the rest coalesce behind it. An adapter that declines to stream is reported on the open call, so the consumer returns `null` with the caller's iterable untouched and Chat SDK's post-and-edit fallback can still read it. Abandoned streams expire after `streamTtlMs` (default five minutes).
+- Bridged `scheduleMessage` and `rehydrateAttachment`, both of which return live values. Each keeps its object on the host and is reached by id: the returned `cancel()` calls back to the host, and the rebuilt `fetchData()` fetches the bytes through it. Scheduled entries are dropped once their delivery time passes.
+- Bridged the inbound events `processReaction`, `processMessageUpdated`, `processMessageDeleted`, `processAction`, `processSlashCommand`, and `abortTurn`. Messages inside an event payload go through the message codec and the reaction emoji is resolved back to the same `EmojiValue` singleton, so `===` comparisons in `onReaction` keep working.
+- `ChatInstance.getUserName()` on the host answers with the wrapped adapter's `userName` instead of the no-op that returned nothing.
+- `getChannelVisibility`, answered from facts the host attaches to each inbound message.
 - `AdapterHost.start()` and `AdapterHost.stop()`, with `autoStart` to opt out of initializing during construction. `start()` is idempotent and rejects loudly; `ready` is now shorthand for it. `stop()` disconnects the adapter and refuses further dispatch, so it can be wired to `SIGTERM`.
-- `AdapterHost.handlePlatformWebhook()`, so adapters driven by platform webhooks rather than a socket have a host-side route that waits for startup first.
+- `createAdapterHost`, the same host left stopped. `serveAdapter` still starts during construction.
+- `AdapterHost.handleWebhook()`, so adapters driven by platform webhooks rather than a socket have a host-side route that waits for startup first.
+- `AdapterHost.fetch`, a bound handler that drops straight into any Fetch-API router.
+- Replay protection. Each signature is accepted once inside its freshness window, on both the host and the consumer. The default store is per-process and bounded; `replayGuard.seen()` may be async, so a shared store can back it.
 - `onError` and `onReady` callbacks on `serveAdapter`. `onError` reports the `initialize`, `forward`, `dispatch`, and `shutdown` phases.
 - `maxConcurrentForwards` (default 8) caps inbound messages in flight to the consumer, so a platform backlog cannot open one request per message.
 - `logForwardLevel` on `serveAdapter`, forwarding the log threshold through to the bridged logger.
@@ -31,13 +43,18 @@ Correctness release following a review against real adapter objects. Anyone on 0
 
 - **Breaking:** `@chat-adapter/shared` moved from a dependency to a peer dependency. Two copies break the `instanceof` checks that error reconstruction relies on.
 - **Breaking:** `RemoteChat` and `RemoteChatUnsupportedMethodError` are no longer exported; use `createRemoteChat`.
+- Per-message facts travel as one object rather than positional arguments, so a new fact does not change arity.
+- Errors raised by this package itself — an unimplemented method, an expired stream, a schedule that can no longer be cancelled — keep their code and message. Errors from the wrapped adapter still collapse to a generic message.
+- An inbound event that arrives before `initialize()` is refused with 503 instead of acknowledged, since a 200 tells the host it was delivered. Inbound handler rejections are caught and logged rather than left unhandled.
 - Inbound requests are acknowledged as soon as the message is accepted, with handlers running under the caller's `waitUntil`, instead of the host blocking on the full handler chain.
 - Request bodies are counted while streaming rather than buffered before the size check.
 - `notify` no longer awaits a response.
 - Response ids are matched against request ids, and the id counter is per client.
 - `RpcErrorCode.REPLAY_REJECTED` renamed to `STALE_TIMESTAMP`, matching what the check actually does.
 - `engines.node >= 20`, `sideEffects: false`, and a `prepublishOnly` guard added.
-- Signing imports `node:crypto` rather than the bare `crypto` specifier, so bundlers stop attempting a browser polyfill.
+- Signing imports `node:crypto` rather than the bare `crypto` specifier, so bundlers stop attempting a browser polyfill. The build no longer strips that prefix back out.
+- zod widened to `^3.0.0 || ^4.0.0`, matching what `chat` already requires of its consumers. The schemas were pinned to v4-only APIs, so a consumer satisfying `chat` with zod v3 installed a second nested copy of v4; they now use the subset both majors share and are exercised against 3.25 and 4.6.
+- The published package no longer ships sourcemaps, and no longer exports `StreamRegistry`, `createRemoteChat`, or the wire schemas. Those are internals, and the package is 22.5 kB from 50.3 kB as a result.
 
 ## 0.1.0
 
