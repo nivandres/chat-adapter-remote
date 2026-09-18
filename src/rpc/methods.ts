@@ -71,6 +71,28 @@ export const HandshakeSchema = z
   })
   .passthrough();
 
+/** The `StateAdapter` surface, as an allowlist: the wire names an operation, never picks one. */
+export const STATE_OPERATIONS = [
+  "acquireLock",
+  "appendToList",
+  "delete",
+  "dequeue",
+  "enqueue",
+  "extendLock",
+  "forceReleaseLock",
+  "get",
+  "getList",
+  "isSubscribed",
+  "queueDepth",
+  "releaseLock",
+  "set",
+  "setIfNotExists",
+  "subscribe",
+  "unsubscribe",
+] as const;
+
+export type StateOperation = (typeof STATE_OPERATIONS)[number];
+
 /** Consumer -> host, dispatched into the real adapter. */
 export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
   z
@@ -358,6 +380,13 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
       method: z.literal("processSlashCommand"),
       id: Id,
       params: z.tuple([z.object({ channelId: z.string() }).passthrough()]),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal("state"),
+      id: Id,
+      params: z.tuple([z.enum(STATE_OPERATIONS), z.array(z.unknown())]),
     })
     .strict(),
   z

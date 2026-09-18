@@ -11,6 +11,7 @@ import type {
   Message,
   ModalElement,
   ScheduledMessage,
+  StateAdapter,
   StreamOptions,
   WebhookOptions,
 } from "chat";
@@ -83,6 +84,17 @@ export interface ServeAdapterOptions extends DispatchOptions {
    * call. `true` exposes the adapter's own public methods.
    */
   customMethods?: string[] | true;
+  /**
+   * Backs the `getState()` the wrapped adapter uses for its own persistence.
+   * Without one, every operation reaches the consumer's store instead.
+   */
+  state?: StateAdapter;
+  /**
+   * Keeps a rejection thrown inside the adapter's own event loop from ending
+   * the process. Those surface nowhere else: they belong to no request, so
+   * nothing here can wrap them. Default true.
+   */
+  catchUnhandledRejections?: boolean;
 }
 
 /** Both are deployment mistakes: failing here beats failing on the first request. */
@@ -122,6 +134,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private readonly dispatchOptions: DispatchOptions;
   private readonly capabilities: OptionalCapability[];
   private readonly customMethods: string[];
+  private onUnhandled?: (error: unknown) => void;
   private readonly streams: StreamRegistry;
   private readonly attachments: AttachmentRegistry;
   private readonly scheduled = new Map<string, ScheduledMessage<TRawMessage>>();
@@ -169,6 +182,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       onError: options.onError,
       userName: adapter.userName,
       attachments: () => this.attachmentPolicy(),
+      state: options.state,
       logForwardLevel: options.logForwardLevel,
       maxConcurrentForwards: options.maxConcurrentForwards,
       maxQueuedForwards: options.maxQueuedForwards,
@@ -185,8 +199,22 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     return this.starting;
   }
 
+  private guardProcess(): void {
+    if (this.options.catchUnhandledRejections === false || this.onUnhandled) {
+      return;
+    }
+    this.onUnhandled = (error: unknown) => {
+      this.logger.error("unhandled rejection inside the adapter", { error });
+      this.options.onError?.(error, { phase: "adapter" });
+    };
+    process.on("unhandledRejection", this.onUnhandled);
+  }
+
   private async initialize(): Promise<void> {
+    this.guardProcess();
     try {
+      // Handed to the host, so its lifecycle belongs to the host.
+      await this.options.state?.connect();
       await this.adapter.initialize(this.chat);
       this.options.onReady?.();
     } catch (error) {
@@ -198,11 +226,16 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   /** Closes the adapter's connection and stops serving. Wire this to SIGTERM. */
   async stop(): Promise<void> {
     this.stopped = true;
+    if (this.onUnhandled) {
+      process.off("unhandledRejection", this.onUnhandled);
+      this.onUnhandled = undefined;
+    }
     this.streams.clear();
     this.scheduled.clear();
     this.attachments.clear();
     try {
       await this.adapter.disconnect?.();
+      await this.options.state?.disconnect();
     } catch (error) {
       this.options.onError?.(error, { phase: "shutdown" });
       throw error;

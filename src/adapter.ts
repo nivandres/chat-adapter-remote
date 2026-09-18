@@ -767,6 +767,14 @@ export class RemoteAdapter<
           call.method,
         );
         return;
+      case "state": {
+        const [operation, args] = call.params;
+        const store = chat.getState() as unknown as Record<
+          string,
+          (...a: unknown[]) => Promise<unknown>
+        >;
+        return store[operation]!(...args);
+      }
       case "abortTurn":
         this.detach(chat.abortTurn(call.params[0]), call.method);
         return;

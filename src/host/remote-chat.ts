@@ -4,6 +4,7 @@ import type {
   EmojiValue,
   Logger,
   Message,
+  StateAdapter,
   WebhookOptions,
 } from "chat";
 import { ConsoleLogger } from "chat";
@@ -12,10 +13,12 @@ import { serializeMessage, type AttachmentPolicy } from "../rpc/message-wire";
 import { EVENT_MESSAGE_KEYS } from "../rpc/methods";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
 import { createBridgingLogger, type LogLevel } from "./logger-bridge";
+import { createRemoteState } from "./state";
 import type { FetchLike } from "../types";
 
 /** Where a failure happened, so callers can route it without parsing messages. */
-export type HostErrorPhase = "initialize" | "forward" | "dispatch" | "shutdown";
+export type HostErrorPhase =
+  "initialize" | "forward" | "dispatch" | "shutdown" | "adapter";
 
 export interface HostErrorContext {
   phase: HostErrorPhase;
@@ -38,6 +41,8 @@ export interface RemoteChatOptions {
   userName?: string;
   /** Builds the per-message attachment policy. */
   attachments?: () => AttachmentPolicy;
+  /** Answers `getState()` locally instead of reaching the consumer for every operation. */
+  state?: StateAdapter;
   /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
@@ -84,6 +89,7 @@ class RemoteChat {
   readonly logger: Logger;
   private readonly rpc: RpcClient;
   private readonly warned = new Set<string>();
+  private state?: StateAdapter;
   private readonly limit: <T>(task: () => Promise<T>) => Promise<T>;
 
   constructor(private readonly options: RemoteChatOptions) {
@@ -291,6 +297,15 @@ class RemoteChat {
 
   abortTurn(threadId: string): Promise<void> {
     return this.forward("abortTurn", [threadId], threadId);
+  }
+
+  getState(): StateAdapter {
+    this.state ??=
+      this.options.state ??
+      createRemoteState((operation, args) =>
+        this.rpc.request("state", [operation, args]),
+      );
+    return this.state;
   }
 
   getUserName(): string {
