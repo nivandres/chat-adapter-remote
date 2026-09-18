@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-async function toFetchRequest(
+async function toRequest(
   req: http.IncomingMessage,
   baseUrl: string,
 ): Promise<Request> {
@@ -11,25 +11,13 @@ async function toFetchRequest(
   for (const [key, value] of Object.entries(req.headers)) {
     if (typeof value === "string") headers.set(key, value);
   }
-  const hasBody = !["GET", "HEAD"].includes(req.method ?? "GET");
+  const method = req.method ?? "GET";
   return new Request(new URL(req.url ?? "/", baseUrl), {
-    method: req.method,
+    method,
     headers,
-    body: hasBody && chunks.length ? Buffer.concat(chunks) : undefined,
+    body:
+      method === "GET" || method === "HEAD" ? undefined : Buffer.concat(chunks),
   });
-}
-
-async function writeFetchResponse(
-  response: Response,
-  res: http.ServerResponse,
-): Promise<void> {
-  const body = Buffer.from(await response.arrayBuffer());
-  const headers: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    headers[key] = value;
-  });
-  res.writeHead(response.status, headers);
-  res.end(body);
 }
 
 export interface RealHttpServer {
@@ -37,16 +25,22 @@ export interface RealHttpServer {
   close: () => Promise<void>;
 }
 
-/** Starts a real Node `http` server on an ephemeral localhost port, bridged to a Fetch API `(request: Request) => Promise<Response>` handler. */
+/** Starts a real Node server on an ephemeral localhost port, bridged to a Fetch API handler. */
 export function startRealServer(
   handler: (request: Request) => Promise<Response>,
 ): Promise<RealHttpServer> {
   return new Promise((resolve) => {
     let baseUrl = "";
     const server = http.createServer((req, res) => {
-      toFetchRequest(req, baseUrl)
+      toRequest(req, baseUrl)
         .then(handler)
-        .then((response) => writeFetchResponse(response, res))
+        .then(async (response) => {
+          const body = Buffer.from(await response.arrayBuffer());
+          const headers: Record<string, string> = {};
+          response.headers.forEach((value, key) => (headers[key] = value));
+          res.writeHead(response.status, headers);
+          res.end(body);
+        })
         .catch((error) => {
           res.writeHead(500);
           res.end(String(error));
@@ -57,7 +51,7 @@ export function startRealServer(
       baseUrl = `http://127.0.0.1:${port}`;
       resolve({
         url: baseUrl,
-        close: () => new Promise((res) => server.close(() => res())),
+        close: () => new Promise((done) => server.close(() => done())),
       });
     });
   });

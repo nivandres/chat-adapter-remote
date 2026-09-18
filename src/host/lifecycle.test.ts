@@ -1,42 +1,43 @@
 import { createMockAdapter } from "@chat-adapter/tests";
-import type { Adapter, ChatInstance } from "chat";
+import type { ChatInstance } from "chat";
 import { describe, expect, it, vi } from "vitest";
 
-import { serveAdapter } from "../host";
+import { createAdapterHost, serveAdapter } from "../host";
+import { sign } from "../rpc/signing";
+import {
+  CONSUMER_URL,
+  SECRET,
+  bridge,
+  deferred,
+  handshake,
+} from "../testing/bridge";
 
 const options = {
-  secret: "s",
-  consumerUrl: "https://consumer.test/inbound",
+  secret: SECRET,
+  consumerUrl: CONSUMER_URL,
   fetch: vi.fn(),
 };
 
 describe("host lifecycle", () => {
-  it("initializes during construction by default", async () => {
+  it("connects during construction, once, however often start() is called", async () => {
     const adapter = createMockAdapter("mock");
     const host = serveAdapter(adapter, options);
 
-    await host.ready;
+    await Promise.all([host.ready, host.start(), host.start()]);
+
     expect(adapter.initialize).toHaveBeenCalledOnce();
   });
 
-  it("defers initialization until start() when autoStart is false", async () => {
+  it("stays stopped when built with createAdapterHost", async () => {
     const adapter = createMockAdapter("mock");
-    const host = serveAdapter(adapter, { ...options, autoStart: false });
+    const host = createAdapterHost(adapter, { ...options, autoStart: true });
 
     expect(adapter.initialize).not.toHaveBeenCalled();
     await host.start();
     expect(adapter.initialize).toHaveBeenCalledOnce();
   });
 
-  it("only initializes once however often start() is called", async () => {
-    const adapter = createMockAdapter("mock");
-    const host = serveAdapter(adapter, { ...options, autoStart: false });
-
-    await Promise.all([host.start(), host.start(), host.ready]);
-    expect(adapter.initialize).toHaveBeenCalledOnce();
-  });
-
-  it("surfaces an initialization failure through start() and onError", async () => {
+  it("reports a failed connection through start() and onError", async () => {
     const onError = vi.fn();
     const host = serveAdapter(
       createMockAdapter("mock", {
@@ -51,14 +52,14 @@ describe("host lifecycle", () => {
     });
   });
 
-  it("calls onReady once the adapter is initialized", async () => {
+  it("calls onReady once connected", async () => {
     const onReady = vi.fn();
     await serveAdapter(createMockAdapter("mock"), { ...options, onReady })
       .ready;
     expect(onReady).toHaveBeenCalledOnce();
   });
 
-  it("disconnects the adapter on stop() and refuses further dispatch", async () => {
+  it("disconnects on stop() and refuses further dispatch", async () => {
     const adapter = createMockAdapter("mock");
     const host = serveAdapter(adapter, options);
     await host.ready;
@@ -66,7 +67,6 @@ describe("host lifecycle", () => {
     await host.stop();
 
     expect(adapter.disconnect).toHaveBeenCalled();
-    const { sign } = await import("../rpc/signing");
     const body = JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -79,7 +79,7 @@ describe("host lifecycle", () => {
         method: "POST",
         body,
         headers: {
-          "x-chat-adapter-remote-signature": sign(body, timestamp, "s"),
+          "x-chat-adapter-remote-signature": sign(body, timestamp, SECRET),
           "x-chat-adapter-remote-timestamp": timestamp,
         },
       }),
@@ -108,11 +108,9 @@ describe("host lifecycle", () => {
 describe("platform webhooks", () => {
   it("waits for startup before handing a delivery to the adapter", async () => {
     const order: string[] = [];
-    let chatInstance: ChatInstance | undefined;
     const adapter = createMockAdapter("mock", {
-      initialize: vi.fn(async (instance: ChatInstance) => {
+      initialize: vi.fn(async () => {
         await new Promise((resolve) => setTimeout(resolve, 20));
-        chatInstance = instance;
         order.push("initialized");
       }),
       handleWebhook: vi.fn(async () => {
@@ -120,27 +118,35 @@ describe("platform webhooks", () => {
         return new Response("ok");
       }),
     });
-
-    const host = serveAdapter(adapter, { ...options, autoStart: false });
-    const response = await host.handlePlatformWebhook(
-      new Request("https://platform.test/events", { method: "POST" }),
-    );
-
-    expect(order).toEqual(["initialized", "webhook"]);
-    expect(await response.text()).toBe("ok");
-    expect(chatInstance).toBeDefined();
-  });
-
-  it("passes webhook options through to the adapter", async () => {
-    const adapter: Adapter = createMockAdapter("mock");
-    const host = serveAdapter(adapter, options);
-    const waitUntil = vi.fn();
+    const host = createAdapterHost(adapter, options);
     const request = new Request("https://platform.test/events", {
       method: "POST",
     });
+    const waitUntil = vi.fn();
 
-    await host.handlePlatformWebhook(request, { waitUntil });
+    const response = await host.handleWebhook(request, { waitUntil });
 
+    expect(order).toEqual(["initialized", "webhook"]);
+    expect(await response.text()).toBe("ok");
     expect(adapter.handleWebhook).toHaveBeenCalledWith(request, { waitUntil });
+  });
+});
+
+describe("log forwarding", () => {
+  it("carries host log lines to the consumer's logger", async () => {
+    const b = bridge();
+    await handshake(b);
+    const logged = deferred<string>();
+    vi.spyOn(b.chat, "getLogger").mockReturnValue({
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: (text: string) => logged.resolve(text),
+      error: vi.fn(),
+      child: vi.fn(),
+    } as never);
+
+    (b.hostChat() as ChatInstance).getLogger("baileys").warn("reconnecting");
+
+    expect(await logged.promise).toBe("reconnecting");
   });
 });

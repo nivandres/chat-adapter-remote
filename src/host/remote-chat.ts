@@ -1,6 +1,7 @@
 import type {
   Adapter,
   ChatInstance,
+  EmojiValue,
   Logger,
   Message,
   WebhookOptions,
@@ -8,6 +9,7 @@ import type {
 import { ConsoleLogger } from "chat";
 
 import { serializeMessage } from "../rpc/message-wire";
+import { EVENT_MESSAGE_KEYS } from "../rpc/methods";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
 import { createBridgingLogger, type LogLevel } from "./logger-bridge";
 import type { FetchLike } from "../types";
@@ -32,6 +34,8 @@ export interface RemoteChatOptions {
   logger?: Logger;
   fetch?: FetchLike;
   onError?: HostErrorHandler;
+  /** Answers `getUserName()`, which cannot be asked of the consumer synchronously. */
+  userName?: string;
   /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
@@ -56,6 +60,11 @@ function createLimiter(limit: number) {
   };
 }
 
+type EventPayload = Record<string, unknown>;
+
+/** Live objects the consumer rebuilds for itself, so they never cross the wire. */
+const LOCAL_EVENT_KEYS = ["adapter", "thread", "channel"] as const;
+
 class RemoteChat {
   readonly logger: Logger;
   private readonly rpc: RpcClient;
@@ -74,11 +83,60 @@ class RemoteChat {
     });
   }
 
-  /**
-   * Adapters call this unawaited from their own event loops, so it must
-   * never reject: a rejection here would surface as an unhandled rejection
-   * and take down the process holding the platform connection.
-   */
+  // Adapters call these unawaited from their event loops, so a rejection here
+  // would be unhandled and would take down the process holding the connection.
+
+  private async forward(
+    method: string,
+    params: unknown[],
+    threadId?: string,
+  ): Promise<void> {
+    try {
+      await this.limit(() => this.rpc.request(method, params));
+    } catch (error) {
+      this.logger.error(`failed to deliver ${method} to consumer`, {
+        threadId,
+        error,
+      });
+      this.options.onError?.(error, { phase: "forward", threadId });
+    }
+  }
+
+  private async resolveMessage(value: unknown): Promise<Message | undefined> {
+    if (!value) return undefined;
+    return typeof value === "function"
+      ? await (value as () => Promise<Message>)()
+      : (value as Message);
+  }
+
+  private async serializeEvent(event: EventPayload): Promise<EventPayload> {
+    const wire: EventPayload = { ...event };
+    for (const key of LOCAL_EVENT_KEYS) delete wire[key];
+
+    for (const key of EVENT_MESSAGE_KEYS) {
+      const message = await this.resolveMessage(wire[key]);
+      if (message) wire[key] = await serializeMessage(message);
+      else delete wire[key];
+    }
+    // EmojiValue.toJSON() gives a placeholder, not the name the consumer needs.
+    if (wire.emoji) wire.emoji = (wire.emoji as EmojiValue).name;
+    return wire;
+  }
+
+  private async forwardEvent(
+    method: string,
+    event: EventPayload,
+  ): Promise<void> {
+    const threadId = event.threadId as string | undefined;
+    try {
+      const wire = await this.serializeEvent(event);
+      await this.forward(method, [wire], threadId);
+    } catch (error) {
+      this.logger.error(`failed to serialize ${method}`, { threadId, error });
+      this.options.onError?.(error, { phase: "forward", threadId });
+    }
+  }
+
   async processMessage(
     adapter: Adapter,
     threadId: string,
@@ -86,21 +144,25 @@ class RemoteChat {
     _options?: WebhookOptions,
   ): Promise<void> {
     try {
-      const resolved =
-        typeof message === "function" ? await message() : message;
+      const resolved = (await this.resolveMessage(message))!;
       const wire = await serializeMessage(resolved, (attachment, error) =>
         this.logger.warn(
           "attachment data unavailable, forwarding metadata only",
           { attachment, error },
         ),
       );
-      await this.limit(() =>
-        this.rpc.request("processMessage", [
+      await this.forward(
+        "processMessage",
+        [
           threadId,
           wire,
-          adapter.channelIdFromThreadId(threadId),
-          adapter.isDM?.(threadId),
-        ]),
+          {
+            channelId: adapter.channelIdFromThreadId(threadId),
+            isDM: adapter.isDM?.(threadId),
+            channelVisibility: adapter.getChannelVisibility?.(threadId),
+          },
+        ],
+        threadId,
       );
     } catch (error) {
       this.logger.error("failed to deliver message to consumer", {
@@ -109,6 +171,34 @@ class RemoteChat {
       });
       this.options.onError?.(error, { phase: "forward", threadId });
     }
+  }
+
+  processReaction(event: EventPayload): void {
+    void this.forwardEvent("processReaction", event);
+  }
+
+  processMessageUpdated(event: EventPayload): Promise<void> {
+    return this.forwardEvent("processMessageUpdated", event);
+  }
+
+  processMessageDeleted(event: EventPayload): Promise<void> {
+    return this.forwardEvent("processMessageDeleted", event);
+  }
+
+  processAction(event: EventPayload): Promise<void> {
+    return this.forwardEvent("processAction", event);
+  }
+
+  processSlashCommand(event: EventPayload): void {
+    void this.forwardEvent("processSlashCommand", event);
+  }
+
+  abortTurn(threadId: string): Promise<void> {
+    return this.forward("abortTurn", [threadId], threadId);
+  }
+
+  getUserName(): string {
+    return this.options.userName ?? "";
   }
 
   getLogger(prefix?: string): Logger {

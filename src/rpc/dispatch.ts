@@ -1,5 +1,6 @@
 import { JsonRpcRequestSchema } from "./envelope";
 import { RpcErrorCode, type RpcErrorObject } from "./errors";
+import type { ReplayGuard } from "./security";
 import {
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
@@ -12,6 +13,8 @@ export interface DispatchOptions {
   /** Rejects requests whose signed timestamp is older than this. Default 30s. */
   timestampToleranceMs?: number;
   maxBodyBytes?: number;
+  /** Rejects a signature that was already accepted inside the freshness window. */
+  replayGuard?: ReplayGuard;
 }
 
 export type VerifiedRequest =
@@ -90,12 +93,22 @@ export async function verifyRequest(
       }),
     };
   }
-  if (!isTimestampFresh(timestamp, options.timestampToleranceMs ?? 30_000)) {
+  const toleranceMs = options.timestampToleranceMs ?? 30_000;
+  if (!isTimestampFresh(timestamp, toleranceMs)) {
     return {
       ok: false,
       response: errorResponse(401, {
         code: RpcErrorCode.STALE_TIMESTAMP,
         message: "Timestamp outside tolerance",
+      }),
+    };
+  }
+  if (await options.replayGuard?.seen(signature, toleranceMs)) {
+    return {
+      ok: false,
+      response: errorResponse(401, {
+        code: RpcErrorCode.REPLAYED,
+        message: "Signature already used",
       }),
     };
   }

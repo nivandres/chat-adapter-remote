@@ -18,6 +18,9 @@ export const RpcErrorCode = {
   UNAUTHORIZED: -32000,
   STALE_TIMESTAMP: -32001,
   METHOD_NOT_IMPLEMENTED: -32002,
+  REPLAYED: -32003,
+  STREAM_NOT_FOUND: -32004,
+  NOT_CANCELLABLE: -32005,
   ADAPTER_ERROR: -32010,
   ADAPTER_RATE_LIMITED: -32011,
   ADAPTER_AUTH_FAILED: -32012,
@@ -114,6 +117,10 @@ export function serializeError(error: unknown): RpcErrorObject {
         originalCode: error.code,
       },
     };
+  }
+  // Raised by this package itself, so the message carries no host internals.
+  if (error instanceof RemoteAdapterRpcError) {
+    return { code: error.code, message: error.message, data: error.data };
   }
   return {
     code: RpcErrorCode.INTERNAL_ERROR,

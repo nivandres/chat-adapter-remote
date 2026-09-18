@@ -1,5 +1,7 @@
 import type { Logger } from "chat";
 
+import type { ReplayGuard } from "./rpc/security";
+
 /** The part of `fetch` this package uses. Narrower than `typeof fetch` so any function can be injected. */
 export type FetchLike = (
   input: string,
@@ -20,6 +22,10 @@ export interface RemoteAdapterConfig {
   timestampToleranceMs?: number;
   /** Rejects inbound bodies larger than this. Default 5MB. */
   maxBodyBytes?: number;
+  /** Rejects an inbound signature that was already accepted. Defaults to a per-process store; supply your own to share one across instances. */
+  replayGuard?: ReplayGuard;
+  /** Thread facts kept from inbound messages, oldest evicted first. Default 1000. */
+  maxCachedThreads?: number;
   logger?: Logger;
   fetch?: FetchLike;
 }
