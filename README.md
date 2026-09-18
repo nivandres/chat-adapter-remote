@@ -80,6 +80,8 @@ process.on("SIGTERM", () => host.stop());
 
 **Inbound** is every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modals, options load, agent-session, assistant and app-home events, and turn cancellation. `getState`, `history` and `transcripts` are not bridged and resolve to a logged no-op.
 
+Adapters that persist their own data call `chat.getState()`. That reaches the consumer's store by default, so both halves share it; pass `state` to the host to give it one of its own instead.
+
 The host reports which optional members its adapter actually implements, and the consumer removes the rest, so Chat's own fallbacks still apply to anything the real adapter never had.
 
 `isDM`, `channelIdFromThreadId` and `getChannelVisibility` are answered from facts the host sends with each message. A thread the consumer has not seen yet falls back to the SDK defaults.

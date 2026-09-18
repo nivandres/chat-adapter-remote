@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+Two defects found running 0.4.0 against a real WhatsApp account, both of which ended the host process.
+
+### Fixed
+
+- `chat.getState()` returned `undefined` on the host, because unbridged `ChatInstance` members resolve to a warning no-op. That is fine for the `processX` events, which return nothing, but an adapter persisting its own data does `chat.getState().set(...)` in one expression and got a `TypeError` far from the cause. Baileys keeps each poll's secret there, so polls could not be sent — and an incoming vote later killed the worker outright. `getState()` now answers with a real store.
+- A rejection thrown inside the adapter's own event loop ended the process. Those belong to no request, so nothing here could wrap them, and `onError` never saw them. The host now keeps them from ending the process and reports them under a new `adapter` phase. Set `catchUnhandledRejections: false` to opt out.
+
+### Added
+
+- `state` on the host. Without one, `getState()` reaches the consumer's store over the same protocol, so both halves share it. With one, the host uses it directly and no operation crosses the wire; the host connects and disconnects it, since it was handed over. The wire names an operation from the `StateAdapter` surface, it never picks one.
+
 ## 0.4.0
 
 ### Fixed
@@ -124,6 +137,7 @@ A correctness pass against real adapter objects, plus an expansion of the bridge
 
 Initial release.
 
+[0.5.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.0...v0.2.1
