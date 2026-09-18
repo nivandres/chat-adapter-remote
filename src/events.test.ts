@@ -220,6 +220,53 @@ describe("attachments", () => {
     expect(downloads).toBe(1);
   });
 
+  it("leaves an adapter that can rehydrate to do it itself", async () => {
+    const big = Buffer.alloc(4096, 9);
+    let held = 0;
+    const b = bridge(
+      {
+        rehydrateAttachment: vi.fn((attachment) => ({
+          ...attachment,
+          fetchData: async () =>
+            Buffer.alloc(4096, Number(attachment.fetchMetadata!.fill)),
+        })),
+      },
+      { maxBodyBytes: 1000 },
+    );
+    await handshake(b);
+    const registry = Reflect.get(b.host, "attachments") as {
+      hold: (read: unknown) => string;
+    };
+    const hold = registry.hold.bind(registry);
+    registry.hold = (read) => {
+      held++;
+      return hold(read);
+    };
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(
+      b.adapter,
+      THREAD,
+      message("@mock-bot look", {
+        attachments: [
+          {
+            type: "image",
+            size: big.length,
+            fetchMetadata: { fill: "9" },
+            fetchData: async () => big,
+          },
+        ],
+      }),
+    );
+
+    const [attachment] = (await received.promise).attachments;
+    // Nothing kept on our side: no id, no TTL, the adapter rebuilds it.
+    expect(held).toBe(0);
+    expect(await attachment!.fetchData!()).toEqual(big);
+    expect(b.adapter.rehydrateAttachment).toHaveBeenCalled();
+  });
+
   it("honours an explicit inlineAttachments setting", async () => {
     const { b, attach } = mediaBridge(png.length, png, {
       inlineAttachments: false,
