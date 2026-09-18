@@ -208,6 +208,39 @@ describe("streaming", () => {
     expect(ended).toBe(true);
   });
 
+  it("reclaims a stream abandoned mid-flight without another stream call", async () => {
+    vi.useFakeTimers();
+    try {
+      let released = false;
+      const b = bridge(
+        {
+          stream: vi.fn(async (_t: string, chunks: AsyncIterable<unknown>) => {
+            for await (const _chunk of chunks) void _chunk;
+            // Reached only once the queue is closed, which is what proves the
+            // adapter was released rather than left blocked forever.
+            released = true;
+            return null;
+          }) as never,
+        },
+        { streamTtlMs: 1000 },
+      );
+      await handshake(b);
+      const rpc = Reflect.get(b.remote, "rpc") as {
+        request: (method: string, params: unknown) => Promise<unknown>;
+      };
+
+      await rpc.request("streamStart", [THREAD, undefined]);
+      expect(released).toBe(false);
+
+      // No further stream call: only the timer can reclaim it.
+      await vi.advanceTimersByTimeAsync(2500);
+
+      expect(released).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("refuses a push for a stream it does not know", async () => {
     const b = streamingBridge(async () => null);
     await handshake(b);
