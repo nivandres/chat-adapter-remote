@@ -6,7 +6,11 @@ import { describe, expect, it, vi } from "vitest";
 import { createRemoteAdapter } from "./adapter";
 import { serveAdapter } from "./host";
 import { serializeMessage } from "./rpc/message-wire";
-import { OPTIONAL_CAPABILITIES, type OptionalCapability } from "./rpc/methods";
+import {
+  OPTIONAL_CAPABILITIES,
+  PROTOCOL_VERSION,
+  type OptionalCapability,
+} from "./rpc/methods";
 import { sign } from "./rpc/signing";
 import {
   CONSUMER_URL,
@@ -74,6 +78,56 @@ describe("inbound messages", () => {
 
     expect((await delivered.promise).text).toBe("no mention here");
     expect(b.remote.isDM("mock:D1:1")).toBe(true);
+  });
+});
+
+describe("subscription and self-messages", () => {
+  it("delivers follow-ups on a subscribed thread", async () => {
+    const b = bridge();
+    await b.host.ready;
+    const first = deferred<void>();
+    const followUp = deferred<string>();
+    b.chat.onNewMention(async (thread) => {
+      await thread.subscribe();
+      first.resolve();
+    });
+    b.chat.onSubscribedMessage(async (_thread, received) =>
+      followUp.resolve(received.text),
+    );
+
+    await b
+      .hostChat()
+      .processMessage(b.adapter, THREAD, message("@mock-bot hi"));
+    await first.promise;
+    await b
+      .hostChat()
+      .processMessage(b.adapter, THREAD, message("no mention needed"));
+
+    expect(await followUp.promise).toBe("no mention needed");
+  });
+
+  it("ignores the bot's own messages", async () => {
+    const b = bridge();
+    await b.host.ready;
+    let handled = 0;
+    b.chat.onNewMessage(/.*/, async () => void handled++);
+
+    await b.hostChat().processMessage(
+      b.adapter,
+      THREAD,
+      message("@mock-bot from myself", {
+        author: {
+          userId: "bot",
+          userName: "mock-bot",
+          fullName: "Mock Bot",
+          isBot: true,
+          isMe: true,
+        },
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(handled).toBe(0);
   });
 });
 
@@ -375,7 +429,11 @@ describe("misconfiguration", () => {
         Response.json({
           jsonrpc: "2.0",
           id: JSON.parse(String(init?.body)).id,
-          result: { protocolVersion: 2, name: "mock", userName: "mock-bot" },
+          result: {
+            protocolVersion: PROTOCOL_VERSION,
+            name: "mock",
+            userName: "mock-bot",
+          },
         }),
     });
     await remote.initialize({

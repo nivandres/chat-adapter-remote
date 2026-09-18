@@ -129,6 +129,7 @@ describe("message wire", () => {
           },
         ],
       }),
+      undefined,
       onError,
     );
     // The SDK reads attachments through fetchData, so a delivered attachment

@@ -136,6 +136,127 @@ describe("inbound events", () => {
   });
 });
 
+describe("attachments", () => {
+  const png = Buffer.alloc(64, 7);
+
+  function mediaBridge(
+    size: number | undefined,
+    bytes: Buffer,
+    hostOptions = {},
+  ) {
+    const b = bridge({}, hostOptions);
+    const attach = () =>
+      message("@mock-bot look", {
+        attachments: [
+          {
+            type: "image",
+            name: "a.png",
+            mimeType: "image/png",
+            size,
+            fetchData: async () => bytes,
+          },
+        ],
+      });
+    return { b, attach };
+  }
+
+  it("inlines small media and still exposes fetchData", async () => {
+    const { b, attach } = mediaBridge(png.length, png);
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(b.adapter, THREAD, attach());
+
+    const [attachment] = (await received.promise).attachments;
+    expect(attachment!.data).toEqual(png);
+    expect(await attachment!.fetchData!()).toEqual(png);
+  });
+
+  it("keeps oversized media on the host and fetches it on demand", async () => {
+    const big = Buffer.alloc(4096, 3);
+    const { b, attach } = mediaBridge(big.length, big, { maxBodyBytes: 1000 });
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(b.adapter, THREAD, attach());
+
+    const [attachment] = (await received.promise).attachments;
+    // Not in the message body: the whole point is that it never inflated it.
+    expect(attachment!.data).toBeUndefined();
+    expect(attachment!.name).toBe("a.png");
+    expect(await attachment!.fetchData!()).toEqual(big);
+  });
+
+  it("never downloads oversized media on the host when the size is known", async () => {
+    const big = Buffer.alloc(4096, 3);
+    let downloads = 0;
+    const b = bridge({}, { maxBodyBytes: 1000 });
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(
+      b.adapter,
+      THREAD,
+      message("@mock-bot look", {
+        attachments: [
+          {
+            type: "image",
+            size: big.length,
+            fetchData: async () => {
+              downloads++;
+              return big;
+            },
+          },
+        ],
+      }),
+    );
+
+    const [attachment] = (await received.promise).attachments;
+    expect(downloads).toBe(0);
+    expect(await attachment!.fetchData!()).toEqual(big);
+    expect(downloads).toBe(1);
+  });
+
+  it("honours an explicit inlineAttachments setting", async () => {
+    const { b, attach } = mediaBridge(png.length, png, {
+      inlineAttachments: false,
+    });
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(b.adapter, THREAD, attach());
+
+    const [attachment] = (await received.promise).attachments;
+    expect(attachment!.data).toBeUndefined();
+    expect(await attachment!.fetchData!()).toEqual(png);
+  });
+
+  it("forwards metadata untouched when the adapter offers no way to read it", async () => {
+    const b = bridge();
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(
+      b.adapter,
+      THREAD,
+      message("@mock-bot look", {
+        attachments: [
+          { type: "file", name: "linked.pdf", url: "https://x.test/a.pdf" },
+        ],
+      }),
+    );
+
+    const [attachment] = (await received.promise).attachments;
+    expect(attachment!.url).toBe("https://x.test/a.pdf");
+    expect(attachment!.fetchData).toBeUndefined();
+  });
+});
+
 describe("events that carry an answer back", () => {
   it("returns the consumer's modal response to the host", async () => {
     const b = bridge();
