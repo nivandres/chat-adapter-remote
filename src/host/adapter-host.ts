@@ -277,6 +277,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
         this.options.maxBodyBytes ?? 5_000_000,
       ),
       registry: this.attachments,
+      rehydratable: typeof this.adapter.rehydrateAttachment === "function",
     };
   }
 

@@ -33,7 +33,11 @@ import { ConsoleLogger, getEmoji } from "chat";
 import { decode, encode } from "./rpc/codec";
 import { verifyRequest } from "./rpc/dispatch";
 import { RpcErrorCode, serializeError } from "./rpc/errors";
-import { deserializeMessage, serializeMessage } from "./rpc/message-wire";
+import {
+  ATTACHMENT_REF,
+  deserializeMessage,
+  serializeMessage,
+} from "./rpc/message-wire";
 import {
   EVENT_MESSAGE_KEYS,
   HandshakeSchema,
@@ -286,10 +290,17 @@ export class RemoteAdapter<
 
   /** Rebuilds a message, wiring any attachment the host kept back to a fetch. */
   private rebuild(wire: unknown): Message {
-    return deserializeMessage(
-      wire,
-      (id) => this.rpc.request("fetchAttachment", [id]) as Promise<Buffer>,
-    );
+    return deserializeMessage(wire, (wired) => {
+      const held = wired[ATTACHMENT_REF];
+      if (held)
+        return () =>
+          this.rpc.request("fetchAttachment", [held]) as Promise<Buffer>;
+      // No bytes and no id: readable only if the host's adapter can rebuild it
+      // from the metadata it sent, which the handshake already told us.
+      if (!wired.fetchMetadata || !this.rehydrateAttachment) return undefined;
+      return () =>
+        this.rpc.request("rehydrateAttachment", [wired]) as Promise<Buffer>;
+    });
   }
 
   private toFetchResult(result: unknown): FetchResult<TRawMessage> {

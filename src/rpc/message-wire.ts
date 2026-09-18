@@ -15,9 +15,16 @@ export type AttachmentBytes = Buffer;
 export interface AttachmentPolicy {
   budget: AttachmentBudget;
   registry: AttachmentRegistry;
+  /**
+   * Whether the adapter can rebuild an attachment from its own
+   * `fetchMetadata`. When it can, deferring needs nothing kept here: the
+   * consumer asks for the helper and the adapter rebuilds it, which survives
+   * a host restart and never expires.
+   */
+  rehydratable: boolean;
 }
 
-type WireAttachment = SerializedMessage["attachments"][number] & {
+export type WireAttachment = SerializedMessage["attachments"][number] & {
   data?: AttachmentBytes;
   [ATTACHMENT_REF]?: string;
 };
@@ -60,24 +67,29 @@ export async function serializeMessage(
       continue;
     }
 
-    // Answering by reference on the reported size alone means an oversized
-    // attachment is never downloaded here at all.
-    if (policy && !policy.budget.allows(attachment.size)) {
+    const defer = (read: () => Promise<AttachmentBytes>) => {
+      // The adapter's own mechanism wins: nothing is held, so nothing expires.
+      if (policy!.rehydratable && attachment.fetchMetadata) {
+        attachments.push(base);
+        return;
+      }
       attachments.push({
         ...base,
-        [ATTACHMENT_REF]: policy.registry.hold(resolve),
+        [ATTACHMENT_REF]: policy!.registry.hold(read),
       });
+    };
+
+    // Deferring on the reported size alone means an oversized attachment is
+    // never downloaded here at all.
+    if (policy && !policy.budget.allows(attachment.size)) {
+      defer(resolve);
       continue;
     }
 
     try {
       const data = await resolve();
       if (policy && !policy.budget.allows(data.byteLength)) {
-        const held = async () => data;
-        attachments.push({
-          ...base,
-          [ATTACHMENT_REF]: policy.registry.hold(held),
-        });
+        defer(async () => data);
         continue;
       }
       policy?.budget.take(data.byteLength);
@@ -91,8 +103,13 @@ export async function serializeMessage(
   return encode({ ...serialized, attachments });
 }
 
-/** Fetches the bytes the host kept back, given the id it sent instead. */
-export type AttachmentResolver = (id: string) => Promise<AttachmentBytes>;
+/**
+ * Builds the way to read an attachment whose bytes did not travel with it,
+ * or returns undefined when there is no way to reach them.
+ */
+export type AttachmentResolver = (
+  wired: WireAttachment,
+) => (() => Promise<AttachmentBytes>) | undefined;
 
 export function deserializeMessage(
   wire: unknown,
@@ -105,16 +122,13 @@ export function deserializeMessage(
 
   message.attachments = message.attachments.map((attachment, index) => {
     const wired = decoded.attachments?.[index];
-    const held = wired?.[ATTACHMENT_REF];
     // `fetchData` is what the SDK reads: `toAiMessages` drops an image that
     // only carries `data`, and rehydration keys off its absence.
-    if (held && resolve) {
-      return { ...attachment, fetchData: () => resolve(held) };
-    }
     const data = wired?.data;
-    return data
-      ? { ...attachment, data, fetchData: async () => data }
-      : attachment;
+    if (data) return { ...attachment, data, fetchData: async () => data };
+
+    const fetchData = wired && resolve ? resolve(wired) : undefined;
+    return fetchData ? { ...attachment, fetchData } : attachment;
   });
 
   return message;
