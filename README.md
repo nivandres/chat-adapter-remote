@@ -78,7 +78,11 @@ process.on("SIGTERM", () => host.stop());
 
 Two members return live values, so each keeps its object on the host and is reached by id: `scheduleMessage` returns a `cancel()` that calls back, and `rehydrateAttachment` returns a `fetchData()` that fetches the bytes through the host.
 
-**Inbound** (into the real `Chat`) covers messages, reactions, edits, deletes, button clicks, slash commands, turn cancellation, and log forwarding. The rest of `ChatInstance` — modal and options-load events, agent-session and app-home events, direct state and history access — is not bridged and resolves to a logged no-op rather than throwing, because adapters call these from inside their own event loops where a throw would kill the host process. Those features silently do nothing.
+**Inbound** (into the real `Chat`) covers every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modal submit and close, options load, agent-session, assistant and app-home events, turn cancellation, and log forwarding. `processModalSubmit` and `processOptionsLoad` are awaited rather than acknowledged, because the platform is waiting on their answer.
+
+What is left is `getState`, `history` and `transcripts`, which hand back live objects rather than data. Those resolve to a logged no-op rather than throwing, because adapters call them from inside their own event loops where a throw would kill the host process.
+
+`npm run support-map` prints the current list, derived from the protocol so it cannot drift.
 
 The host reports which optional members its adapter actually implements, and the consumer removes the rest from itself. Chat decides what an adapter can do with `adapter.method?.()`, so a method the real adapter never had stays absent and its built-in fallback still applies.
 

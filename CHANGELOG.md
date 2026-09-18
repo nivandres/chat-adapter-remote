@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1
+
+Hardening pass driven by running 0.2.0 against a real WhatsApp adapter, plus the rest of the inbound surface.
+
+### Fixed
+
+- Missing `secret`, `url` or `consumerUrl` crashed on the first request with `The "key" argument must be of type string` or `Failed to parse URL from undefined`, neither of which names the missing option. Both sides now fail at construction saying which one it is.
+- Every request rejected before it was parsed — bad signature, oversized body, malformed JSON — reached the caller as `response id did not match request`. Those answer with `id: null` per JSON-RPC, and the client matched the id before reading the error, so the real reason was never visible. The error is now read first.
+- The host sanitises adapter errors on the wire but did not log them locally either, so a failing call left no trace on either side. The host now logs the original error before sanitising it.
+- A throw inside request verification escaped `handleRequest` and `handleWebhook`, because verification ran outside their try/catch. An unhandled rejection there takes down the process holding the platform connection; both now answer with an error response instead.
+- `streamStart` could hang forever on an adapter that neither answered nor started reading, holding the request open with no stream id, so nothing was left for the sweep to reclaim. It now gives up after `streamStartTimeoutMs` (default ten seconds).
+- The forward limiter let a new arrival overtake messages already queued, and its queue was unbounded, so a history sync could park an arbitrary number of pending promises. Arrivals now queue behind the backlog, which is capped by `maxQueuedForwards` (default 1000).
+
+### Added
+
+- `onError` on the consumer too, since it is the half that runs where no debugger can be attached. Inbound handler failures reach it instead of only the logger.
+- Bridged the remaining inbound events whose payload is plain data: `processModalSubmit`, `processModalClose`, `processOptionsLoad`, `processAppHomeOpened`, `processAppContextChanged`, `processAssistantThreadStarted`, `processAssistantContextChanged`, `processAgentSessionStopped`, `processAgentSessionTitleChanged`, and `processMemberJoinedChannel`. `processModalSubmit` and `processOptionsLoad` are awaited rather than acknowledged, so the consumer's answer reaches the platform. Only `getState`, `history` and `transcripts` are left, and those hand back live objects rather than data.
+- `npm run support-map`, which prints what the bridge carries, derived from the protocol so it cannot drift from the code.
+
+### Compatibility
+
+The protocol version is unchanged, so 0.2.0 and 0.2.1 interoperate. A 0.2.1 host sending one of the new events to a 0.2.0 consumer is answered with a validation error and logged, rather than failing the connection.
+
 ## 0.2.0
 
 A correctness pass against real adapter objects, plus an expansion of the bridged surface to almost all of the `Adapter` interface. Anyone on 0.1.0 should upgrade; the bugs below cause silent message loss, corrupted data, and host crashes. The handshake now carries a protocol version, so both sides must be upgraded together.
@@ -60,5 +83,6 @@ A correctness pass against real adapter objects, plus an expansion of the bridge
 
 Initial release.
 
+[0.2.1]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nivandres/chat-adapter-remote/releases/tag/v0.1.0
