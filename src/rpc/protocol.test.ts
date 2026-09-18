@@ -175,6 +175,24 @@ describe("errors", () => {
 });
 
 describe("transport", () => {
+  it("refuses a response larger than the body limit", async () => {
+    const client = createRpcClient({
+      url: "https://host.test/rpc",
+      secret: "s",
+      maxBodyBytes: 1024,
+      fetch: async (_url, init) =>
+        Response.json({
+          jsonrpc: "2.0",
+          id: JSON.parse(String(init?.body)).id,
+          result: "x".repeat(4096),
+        }),
+    });
+
+    await expect(client.request("fetchAttachment", ["a1"])).rejects.toThrow(
+      /larger than/,
+    );
+  });
+
   it("matches responses to their own request and never throws from notify", async () => {
     const client = createRpcClient({
       url: "https://host.test/rpc",
@@ -202,5 +220,52 @@ describe("transport", () => {
     expect(() =>
       mismatched.notify("log", ["info", "", "hi", []]),
     ).not.toThrow();
+  });
+});
+
+describe("host bookkeeping", () => {
+  it("expires what the consumer stopped asking for", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ExpiringMap } = await import("../host/expiring");
+      const expired: string[] = [];
+      const map = new ExpiringMap<string>(1000, (value) => expired.push(value));
+      const id = map.add("x", "held");
+
+      expect(map.get(id)).toBe("held");
+      vi.setSystemTime(Date.now() + 1500);
+      await vi.advanceTimersByTimeAsync(1100);
+
+      expect(expired).toEqual(["held"]);
+      expect(map.get(id)).toBeUndefined();
+      expect(map.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the forwarding threshold across child loggers", async () => {
+    const { createBridgingLogger } = await import("../host/logger-bridge");
+    const sent: string[] = [];
+    const local = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      child: vi.fn(function (this: unknown) {
+        return this;
+      }),
+    };
+    const logger = createBridgingLogger({
+      localLogger: local as never,
+      forwardLevel: "warn",
+      notify: (_level, _prefix, text) => sent.push(text),
+    });
+
+    // Baileys logs through a child, so the bridge has to survive one.
+    logger.child("baileys").warn("reconnecting");
+    logger.child("baileys").debug("noise");
+
+    expect(sent).toEqual(["reconnecting"]);
   });
 });

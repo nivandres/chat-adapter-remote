@@ -490,7 +490,7 @@ describe("request verification", () => {
     JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
 
   it("rejects anything it cannot vouch for, without dispatching", async () => {
-    const b = bridge();
+    const b = bridge({}, { maxBodyBytes: 1_000_000 });
     await b.host.ready;
     const cases = [
       [
@@ -551,7 +551,7 @@ describe("request verification", () => {
     ];
 
     for (const [, secret, expected] of cases) {
-      const b = bridge();
+      const b = bridge({}, { maxBodyBytes: 1_000_000 });
       await b.host.ready;
       const remote = createRemoteAdapter({
         url: HOST_URL,

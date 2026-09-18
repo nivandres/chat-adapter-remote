@@ -267,6 +267,94 @@ describe("attachments", () => {
     expect(b.adapter.rehydrateAttachment).toHaveBeenCalled();
   });
 
+  it("still defers large media when no body limit is set", async () => {
+    const big = Buffer.alloc(8_000_000, 1);
+    const b = bridge();
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(
+      b.adapter,
+      THREAD,
+      message("@mock-bot look", {
+        attachments: [
+          { type: "video", size: big.length, fetchData: async () => big },
+        ],
+      }),
+    );
+
+    const [attachment] = (await received.promise).attachments;
+    expect(attachment!.data).toBeUndefined();
+    expect((await attachment!.fetchData!()).byteLength).toBe(big.length);
+  });
+
+  it("can read a deferred attachment more than once", async () => {
+    const big = Buffer.alloc(4096, 3);
+    let fetches = 0;
+    const b = bridge({}, { maxBodyBytes: 1000 });
+    await handshake(b);
+    const received = deferred<Message>();
+    b.chat.onNewMention(async (_thread, m) => received.resolve(m));
+
+    await b.hostChat().processMessage(
+      b.adapter,
+      THREAD,
+      message("@mock-bot look", {
+        attachments: [
+          {
+            type: "image",
+            size: big.length,
+            fetchData: async () => {
+              fetches++;
+              return big;
+            },
+          },
+        ],
+      }),
+    );
+
+    const [attachment] = (await received.promise).attachments;
+    // toAiMessages reads it, then a handler reads it again.
+    expect(await attachment!.fetchData!()).toEqual(big);
+    expect(await attachment!.fetchData!()).toEqual(big);
+    expect(fetches).toBe(1);
+  });
+
+  it("spends one budget across a whole fetchMessages response", async () => {
+    const chunk = Buffer.alloc(400, 1);
+    const b = bridge(
+      {
+        fetchMessages: vi.fn(async () => ({
+          messages: Array.from({ length: 6 }, () =>
+            message("history", {
+              attachments: [
+                {
+                  type: "image",
+                  size: chunk.length,
+                  fetchData: async () => chunk,
+                },
+              ],
+            }),
+          ),
+        })),
+      },
+      { maxBodyBytes: 1000 },
+    );
+    await handshake(b);
+
+    const result = await b.remote.fetchMessages(THREAD);
+
+    // Six messages share one body, so the budget cannot reset per message.
+    const inlined = result.messages.filter(
+      (m) => m.attachments[0]?.data,
+    ).length;
+    expect(inlined).toBeLessThan(6);
+    for (const m of result.messages) {
+      expect(await m.attachments[0]!.fetchData!()).toEqual(chunk);
+    }
+  });
+
   it("honours an explicit inlineAttachments setting", async () => {
     const { b, attach } = mediaBridge(png.length, png, {
       inlineAttachments: false,
