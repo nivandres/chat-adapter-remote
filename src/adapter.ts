@@ -6,6 +6,7 @@ import type {
   FetchOptions,
   FetchResult,
   FormattedContent,
+  LockScope,
   Logger,
   Message,
   RawMessage,
@@ -15,63 +16,62 @@ import type {
 } from "chat";
 import { ConsoleLogger } from "chat";
 
-import { deserializeMessageFromWire } from "./rpc/message-wire";
-import { verifyAndParse } from "./rpc/dispatch";
+import { verifyRequest } from "./rpc/dispatch";
 import { RpcErrorCode, serializeError } from "./rpc/errors";
-import { INBOUND_CALLS } from "./rpc/methods";
+import { deserializeMessage } from "./rpc/message-wire";
+import {
+  HandshakeSchema,
+  INBOUND_CALLS,
+  PROTOCOL_VERSION,
+} from "./rpc/methods";
 import { createRpcClient, type RpcClient } from "./rpc/transport";
 import type { RemoteAdapterConfig } from "./types";
 
 /**
- * Thrown by the three `Adapter` members declared synchronous, which cannot
- * be bridged over an async RPC call. Chat SDK core never calls these on an
- * adapter it holds — they exist only for an adapter's own internal use,
- * unlike `channelIdFromThreadId`, which core does call and which
- * `RemoteAdapter` answers locally instead (see below).
+ * Thrown by the `Adapter` members that are synchronous and therefore cannot
+ * be answered over RPC. Chat SDK core never calls these on an adapter it
+ * holds; they exist for an adapter's own internal use.
  */
 export class RemoteAdapterUnsupportedSyncMethodError extends Error {
   constructor(method: string) {
     super(
-      `chat-adapter-remote: Adapter.${method} is synchronous and cannot be bridged over RPC. ` +
-        `Chat SDK core never calls this method on an adapter it holds, so this should not be reachable in practice.`,
+      `chat-adapter-remote: Adapter.${method} is synchronous and cannot be bridged`,
     );
     this.name = "RemoteAdapterUnsupportedSyncMethodError";
   }
 }
 
-function jsonRpcResponse(id: unknown, result: unknown): Response {
-  return Response.json({ jsonrpc: "2.0", id: id ?? null, result });
+interface ThreadFacts {
+  channelId: string;
+  isDM: boolean;
 }
 
 /**
- * The consumer-side fake `Adapter`, registered on the real `Chat` instance
- * like any other adapter. Every outbound call forwards to the host over
- * signed HTTP JSON-RPC; `handleWebhook` is the real inbound receiver the
- * host calls into.
+ * The consumer-side stand-in, registered on a real `Chat` like any other
+ * adapter. Outbound calls forward to the host; `handleWebhook` receives the
+ * events the host forwards back.
  */
 export class RemoteAdapter<
   TThreadId = unknown,
   TRawMessage = unknown,
 > implements Adapter<TThreadId, TRawMessage> {
-  name: string;
+  readonly name: string;
   userName: string;
   botUserId?: string;
+  lockScope?: LockScope;
+  persistThreadHistory?: boolean;
+  supportsTurnCancellation?: boolean;
 
   private chat: ChatInstance | null = null;
   private readonly rpc: RpcClient;
   private readonly logger: Logger;
-  private readonly secret: string;
-  private readonly replayWindowMs?: number;
-  private readonly maxBodyBytes?: number;
-  /** threadId -> channelId, populated from every inbound `processMessage`; lets `channelIdFromThreadId()` answer synchronously. */
-  private readonly channelIdCache = new Map<string, string>();
+  private readonly threads = new Map<string, ThreadFacts>();
 
   constructor(private readonly config: RemoteAdapterConfig) {
     this.name = config.name ?? "remote";
     this.userName = config.userName ?? this.name;
     this.logger =
       config.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
-    this.secret = config.secret;
     this.rpc = createRpcClient({
       url: config.url,
       secret: config.secret,
@@ -82,21 +82,36 @@ export class RemoteAdapter<
 
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
-    const info = (await this.rpc.request("__handshake", [])) as {
-      name: string;
-      userName: string;
-      botUserId?: string;
-    };
-    if (!this.config.name) this.name = info.name;
-    if (!this.config.userName) this.userName = info.userName;
-    this.botUserId = info.botUserId;
+    const handshake = HandshakeSchema.parse(
+      await this.rpc.request("__handshake", []),
+    );
+    if (handshake.protocolVersion !== PROTOCOL_VERSION) {
+      throw new Error(
+        `chat-adapter-remote: protocol mismatch, host speaks v${handshake.protocolVersion} and this consumer speaks v${PROTOCOL_VERSION}`,
+      );
+    }
+    if (handshake.name !== this.name) {
+      this.logger.warn(
+        `host adapter is named "${handshake.name}" but this adapter is registered as "${this.name}"`,
+      );
+    }
+    if (!this.config.userName) this.userName = handshake.userName;
+    this.botUserId = handshake.botUserId;
+    this.lockScope = handshake.lockScope;
+    this.persistThreadHistory = handshake.persistThreadHistory;
+    this.supportsTurnCancellation = handshake.supportsTurnCancellation;
   }
 
-  /** Cached value from inbound traffic, or the standard `{adapter}:{channel}` fallback for a threadId not seen yet. Never RPC-forwarded. */
+  /** Answered from facts the host sends with each inbound message, falling back to the `{adapter}:{channel}` convention. */
   channelIdFromThreadId(threadId: string): string {
-    const cached = this.channelIdCache.get(threadId);
-    if (cached) return cached;
-    return threadId.split(":").slice(0, 2).join(":");
+    return (
+      this.threads.get(threadId)?.channelId ??
+      threadId.split(":").slice(0, 2).join(":")
+    );
+  }
+
+  isDM(threadId: string): boolean {
+    return this.threads.get(threadId)?.isDM ?? false;
   }
 
   encodeThreadId(): never {
@@ -109,9 +124,7 @@ export class RemoteAdapter<
     throw new RemoteAdapterUnsupportedSyncMethodError("renderFormatted");
   }
   parseMessage(): never {
-    throw new Error(
-      "RemoteAdapter.parseMessage is never called — messages arrive pre-parsed via handleWebhook.",
-    );
+    throw new RemoteAdapterUnsupportedSyncMethodError("parseMessage");
   }
 
   async postMessage(
@@ -145,7 +158,6 @@ export class RemoteAdapter<
     messageId: string,
     emoji: EmojiValue | string,
   ): Promise<void> {
-    // EmojiValue.toJSON() returns a placeholder string, not .name, so this normalizes before the wire.
     await this.rpc.request("addReaction", [
       threadId,
       messageId,
@@ -172,18 +184,27 @@ export class RemoteAdapter<
     const result = (await this.rpc.request("fetchMessages", [
       threadId,
       options,
-    ])) as { messages: unknown[]; nextCursor?: string };
+    ])) as {
+      messages: unknown[];
+      nextCursor?: string;
+    };
     return {
       messages: result.messages.map(
-        (wire) =>
-          deserializeMessageFromWire(wire) as unknown as Message<TRawMessage>,
+        (wire) => deserializeMessage(wire) as unknown as Message<TRawMessage>,
       ),
       nextCursor: result.nextCursor,
     };
   }
 
   async fetchThread(threadId: string): Promise<ThreadInfo> {
-    return (await this.rpc.request("fetchThread", [threadId])) as ThreadInfo;
+    const info = (await this.rpc.request("fetchThread", [
+      threadId,
+    ])) as ThreadInfo;
+    this.threads.set(threadId, {
+      channelId: info.channelId,
+      isDM: info.isDM ?? this.isDM(threadId),
+    });
+    return info;
   }
 
   async startTyping(
@@ -198,15 +219,19 @@ export class RemoteAdapter<
     await this.rpc.request("disconnect", []);
   }
 
-  /** The real inbound entry point — the host calls this to deliver events forwarded from the real adapter, then runs `chat.processMessage()` locally. */
+  /**
+   * Receives events the host forwards. Acknowledges as soon as the message is
+   * accepted; the handler runs under the caller's `waitUntil`, matching how
+   * every other adapter's webhook behaves.
+   */
   async handleWebhook(
     request: Request,
     options?: WebhookOptions,
   ): Promise<Response> {
-    const verified = await verifyAndParse(request, {
-      secret: this.secret,
-      replayWindowMs: this.replayWindowMs,
-      maxBodyBytes: this.maxBodyBytes,
+    const verified = await verifyRequest(request, {
+      secret: this.config.secret,
+      timestampToleranceMs: this.config.timestampToleranceMs,
+      maxBodyBytes: this.config.maxBodyBytes,
     });
     if (!verified.ok) return verified.response;
 
@@ -216,7 +241,21 @@ export class RemoteAdapter<
       params: verified.params,
     });
     if (!call.success) {
-      return jsonRpcResponse(verified.id, null); // unknown/invalid inbound call: acknowledge, do nothing
+      this.logger.error("rejected inbound call", {
+        method: verified.method,
+        issues: call.error.issues,
+      });
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          id: verified.id ?? null,
+          error: {
+            code: RpcErrorCode.INVALID_PARAMS,
+            message: `Unsupported or malformed inbound call: ${verified.method}`,
+          },
+        },
+        { status: 400 },
+      );
     }
 
     if (call.data.method === "log") {
@@ -225,19 +264,18 @@ export class RemoteAdapter<
       return new Response(null, { status: 204 });
     }
 
-    // processMessage
-    const [threadId, wireMessage, channelId] = call.data.params;
-    this.channelIdCache.set(threadId, channelId);
+    const [threadId, wire, channelId, isDM] = call.data.params;
+    this.threads.set(threadId, { channelId, isDM: isDM ?? false });
 
     try {
-      const message = deserializeMessageFromWire(wireMessage);
-      await this.chat?.processMessage(this, threadId, message, options);
-      return jsonRpcResponse(verified.id, null);
+      const message = deserializeMessage(wire);
+      void this.chat?.processMessage(this, threadId, message, options);
+      return Response.json({ jsonrpc: "2.0", id: call.data.id, result: null });
     } catch (error) {
       const wireError = serializeError(error);
       return Response.json(
-        { jsonrpc: "2.0", id: verified.id ?? null, error: wireError },
-        { status: wireError.code === RpcErrorCode.INTERNAL_ERROR ? 500 : 200 },
+        { jsonrpc: "2.0", id: call.data.id, error: wireError },
+        { status: 500 },
       );
     }
   }

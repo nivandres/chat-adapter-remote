@@ -1,53 +1,44 @@
 import type { Attachment, Message } from "chat";
 import { Message as MessageClass } from "chat";
 
-import { decodeBuffers, encodeBuffers } from "./buffers";
-import type { WireMessageSchema } from "./methods";
-import type { z } from "zod";
+import { decode, encode } from "./codec";
 
-type WireMessage = z.infer<typeof WireMessageSchema>;
+type SerializedMessage = Parameters<typeof MessageClass.fromJSON>[0];
 
 /**
- * `Message.toJSON()` omits attachment `data`/`fetchData` since a closure
- * can't survive JSON, so this resolves any `fetchData` to a real Buffer
- * first and merges it back onto the serialized attachment before encoding.
- * A failed `fetchData()` forwards that one attachment as metadata-only
- * instead of failing the whole message.
+ * `Message.toJSON()` omits attachment `data`/`fetchData`, since a closure
+ * cannot survive JSON. This resolves `fetchData` to a real Buffer first and
+ * merges it back onto the serialized attachment. A failed resolve forwards
+ * that attachment as metadata-only rather than failing the whole message.
  */
-export async function serializeMessageForWire(
+export async function serializeMessage(
   message: Message,
-  onFetchDataError?: (attachment: Attachment, error: unknown) => void,
+  onAttachmentError?: (attachment: Attachment, error: unknown) => void,
 ): Promise<unknown> {
   const serialized = message.toJSON();
-  const attachmentsWithData = await Promise.all(
+  const attachments = await Promise.all(
     message.attachments.map(async (attachment, index) => {
       const base = serialized.attachments[index]!;
       if (attachment.data) return { ...base, data: attachment.data };
-      if (typeof attachment.fetchData === "function") {
-        try {
-          const data = await attachment.fetchData();
-          return { ...base, data };
-        } catch (error) {
-          onFetchDataError?.(attachment, error);
-          return base;
-        }
+      if (typeof attachment.fetchData !== "function") return base;
+      try {
+        return { ...base, data: await attachment.fetchData() };
+      } catch (error) {
+        onAttachmentError?.(attachment, error);
+        return base;
       }
-      return base;
     }),
   );
-  return encodeBuffers({ ...serialized, attachments: attachmentsWithData });
+  return encode({ ...serialized, attachments });
 }
 
-/** Inverse of {@link serializeMessageForWire}: decodes buffers, reconstructs via `Message.fromJSON`, then patches attachment data back on. */
-export function deserializeMessageFromWire(wire: unknown): Message {
-  const decoded = decodeBuffers(wire) as WireMessage & {
+export function deserializeMessage(wire: unknown): Message {
+  const decoded = decode(wire) as SerializedMessage & {
     attachments: Array<{ data?: Buffer }>;
   };
-  const message = MessageClass.fromJSON(
-    decoded as Parameters<typeof MessageClass.fromJSON>[0],
-  );
+  const message = MessageClass.fromJSON(decoded);
   message.attachments = message.attachments.map((attachment, index) => {
-    const data = decoded.attachments[index]?.data;
+    const data = decoded.attachments?.[index]?.data;
     return data ? { ...attachment, data } : attachment;
   });
   return message;

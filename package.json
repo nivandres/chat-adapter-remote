@@ -1,8 +1,11 @@
 {
   "name": "chat-adapter-remote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run any Chat SDK adapter in a separate process or deployment from your bot logic, bridged over signed HTTP JSON-RPC",
+  "author": "nivandres",
+  "license": "MIT",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,8 +28,12 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -37,24 +44,27 @@
     "lint": "oxlint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check": "bun run typecheck && bun run typecheck:examples && bun run lint && bun run format:check && bun run test",
+    "prepublishOnly": "bun run clean && bun run check && bun run build",
     "clean": "rm -rf dist"
   },
   "peerDependencies": {
+    "@chat-adapter/shared": "^4.40.0",
     "chat": "^4.40.0"
   },
   "dependencies": {
-    "@chat-adapter/shared": "^4.0.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@chat-adapter/state-memory": "^4.0.0",
-    "@chat-adapter/tests": "^4.0.0",
+    "@chat-adapter/shared": "^4.40.0",
+    "@chat-adapter/state-memory": "^4.40.0",
+    "@chat-adapter/tests": "^4.40.0",
     "@types/bun": "^1.4.2",
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
     "@vitest/coverage-v8": "^4.0.0",
     "baileys": "^7.0.0-rc14",
-    "chat": "^4.0.0",
+    "chat": "^4.40.0",
     "chat-adapter-baileys": "^2.1.0",
     "oxlint": "^1.61.0",
     "prettier": "^3.8.3",
@@ -72,6 +82,5 @@
     "remote",
     "rpc",
     "proxy"
-  ],
-  "license": "MIT"
+  ]
 }

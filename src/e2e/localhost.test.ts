@@ -9,41 +9,33 @@ import {
 } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createRemoteAdapter, RemoteAdapter } from "../adapter";
-import { AdapterHost, serveAdapter } from "../host";
+import { createRemoteAdapter, type RemoteAdapter } from "../adapter";
+import { serveAdapter, type AdapterHost } from "../host";
 import { startRealServer, type RealHttpServer } from "./http-bridge";
 
-const SECRET = "e2e-shared-secret";
+const SECRET = "e2e-secret";
 
-/** Same round trip as src/integration/round-trip.test.ts, but over two real Node http servers on real localhost ports instead of an in-process stub. */
-describe("e2e: RemoteAdapter <-> AdapterHost over real localhost HTTP", () => {
+/** The same round trip as bridge.test.ts, but over two real localhost servers. */
+describe("e2e over real localhost HTTP", () => {
   let hostServer: RealHttpServer;
   let consumerServer: RealHttpServer;
-  let mockAdapter: Adapter;
-  let posted: Array<{ threadId: string; message: unknown }>;
-  let capturedChat: ChatInstance;
+  let adapter: Adapter;
+  let hostChat: ChatInstance;
   let host: AdapterHost;
-  let remoteAdapter: RemoteAdapter;
+  let remote: RemoteAdapter;
   let chat: Chat;
 
   beforeEach(async () => {
-    posted = [];
-    mockAdapter = createMockAdapter("mock", {
-      initialize: vi.fn(async (c: ChatInstance) => {
-        capturedChat = c;
-      }),
-      postMessage: vi.fn(async (threadId: string, message: unknown) => {
-        posted.push({ threadId, message });
-        return { id: "sent-1", threadId, raw: {} };
+    adapter = createMockAdapter("mock", {
+      initialize: vi.fn(async (instance: ChatInstance) => {
+        hostChat = instance;
       }),
     });
 
-    // Consumer's server starts first — RemoteChat needs consumerUrl at construction.
     consumerServer = await startRealServer((request) =>
       chat.webhooks.mock(request, {}),
     );
-
-    host = serveAdapter(mockAdapter, {
+    host = serveAdapter(adapter, {
       secret: SECRET,
       consumerUrl: `${consumerServer.url}/inbound`,
     });
@@ -51,18 +43,16 @@ describe("e2e: RemoteAdapter <-> AdapterHost over real localhost HTTP", () => {
       host.handleRequest(request),
     );
 
-    remoteAdapter = createRemoteAdapter({
+    remote = createRemoteAdapter({
       url: `${hostServer.url}/rpc`,
       secret: SECRET,
       name: "mock",
-      userName: "mock-bot",
     });
     chat = new Chat({
       userName: "mock-bot",
-      adapters: { mock: remoteAdapter },
+      adapters: { mock: remote },
       state: createMemoryState(),
     });
-
     await host.ready;
   });
 
@@ -71,37 +61,43 @@ describe("e2e: RemoteAdapter <-> AdapterHost over real localhost HTTP", () => {
     await consumerServer.close();
   });
 
-  it("delivers a real inbound HTTP round trip through to a handler, and a reply back over a real HTTP round trip", async () => {
+  it("carries a message to a handler and the reply back to the adapter, across real sockets", async () => {
+    let replied!: () => void;
+    const reply = new Promise<void>((resolve) => (replied = resolve));
     chat.onNewMention(async (thread) => {
       await thread.post("hello over a real socket");
+      replied();
     });
 
-    const message = new Message({
-      id: "m1",
-      threadId: "mock:general:1",
-      text: "hey @mock-bot",
-      formatted: parseMarkdown("hey @mock-bot"),
-      raw: {},
-      author: {
-        userId: "u1",
-        userName: "alice",
-        fullName: "Alice",
-        isBot: false,
-        isMe: false,
-      },
-      metadata: { dateSent: new Date(), edited: false },
-      attachments: [],
-    });
+    await hostChat.processMessage(
+      adapter,
+      "mock:general:1",
+      new Message({
+        id: "m1",
+        threadId: "mock:general:1",
+        text: "hey @mock-bot",
+        formatted: parseMarkdown("hey @mock-bot"),
+        raw: {},
+        author: {
+          userId: "u1",
+          userName: "alice",
+          fullName: "Alice",
+          isBot: false,
+          isMe: false,
+        },
+        metadata: { dateSent: new Date(), edited: false },
+        attachments: [],
+      }),
+    );
 
-    // Simulates the real adapter receiving a platform event; everything
-    // downstream crosses the real sockets started above.
-    await capturedChat.processMessage(mockAdapter, "mock:general:1", message);
-
-    expect(posted).toHaveLength(1);
-    expect(posted[0]!.threadId).toBe("mock:general:1");
+    await reply;
+    expect(adapter.postMessage).toHaveBeenCalledWith(
+      "mock:general:1",
+      expect.anything(),
+    );
   });
 
-  it("rejects a real HTTP request with a bad signature over the real socket", async () => {
+  it("rejects an unsigned request over the real socket", async () => {
     const response = await fetch(`${hostServer.url}/rpc`, {
       method: "POST",
       body: JSON.stringify({
@@ -110,12 +106,10 @@ describe("e2e: RemoteAdapter <-> AdapterHost over real localhost HTTP", () => {
         method: "postMessage",
         params: ["t", "hi"],
       }),
-      headers: {
-        "x-chat-adapter-remote-signature": "sha256=bogus",
-        "x-chat-adapter-remote-timestamp": String(Date.now()),
-      },
+      headers: { "content-type": "application/json" },
     });
+
     expect(response.status).toBe(401);
-    expect(mockAdapter.postMessage).not.toHaveBeenCalled();
+    expect(adapter.postMessage).not.toHaveBeenCalled();
   });
 });

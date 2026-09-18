@@ -1,25 +1,34 @@
-import type { Adapter, AdapterPostableMessage, Logger } from "chat";
+import type {
+  Adapter,
+  AdapterPostableMessage,
+  FetchResult,
+  Logger,
+  Message,
+} from "chat";
 
-import { decodeBuffers, encodeBuffers } from "../rpc/buffers";
-import { verifyAndParse, type DispatchOptions } from "../rpc/dispatch";
+import { decode, encode } from "../rpc/codec";
+import { verifyRequest, type DispatchOptions } from "../rpc/dispatch";
 import { RpcErrorCode, serializeError } from "../rpc/errors";
-import { OUTBOUND_CALLS } from "../rpc/methods";
-import { RemoteChat, type RemoteChatOptions } from "./remote-chat";
+import { serializeMessage } from "../rpc/message-wire";
+import { OUTBOUND_CALLS, PROTOCOL_VERSION } from "../rpc/methods";
+import { createRemoteChat } from "./remote-chat";
+import type { FetchLike } from "../types";
 
 export interface ServeAdapterOptions extends DispatchOptions {
-  /** URL of the consumer's inbound endpoint (RemoteAdapter.handleWebhook). */
+  /** URL of the consumer's inbound endpoint. */
   consumerUrl: string;
   timeoutMs?: number;
   logger?: Logger;
-  /** Override the fetch implementation RemoteChat uses to forward inbound events. Mainly for tests. */
-  fetch?: typeof fetch;
+  fetch?: FetchLike;
 }
 
-function jsonRpcSuccess(id: string | number | null, result: unknown): Response {
-  return Response.json({ jsonrpc: "2.0", id, result });
+function success(id: string | number, result: unknown): Response {
+  // JSON.stringify drops an undefined property, which would leave the
+  // response without the `result` member the envelope requires.
+  return Response.json({ jsonrpc: "2.0", id, result: result ?? null });
 }
 
-function jsonRpcError(
+function failure(
   id: string | number | null,
   code: number,
   message: string,
@@ -29,57 +38,45 @@ function jsonRpcError(
 }
 
 /**
- * Wraps a real, unmodified `Adapter` instance and exposes it over signed
- * HTTP JSON-RPC. Hands the real adapter a fake `ChatInstance` (`RemoteChat`)
- * so its own `initialize()`/`processMessage()` calls forward back to the
- * consumer instead of running local handlers.
+ * Wraps a real adapter and exposes it over signed HTTP JSON-RPC, handing it a
+ * stand-in `ChatInstance` whose calls forward back to the consumer.
  */
 export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
-  private readonly remoteChat: RemoteChat;
-  private readonly initializePromise: Promise<void>;
+  private readonly initialized: Promise<void>;
 
   constructor(
     private readonly adapter: Adapter<TThreadId, TRawMessage>,
     private readonly options: ServeAdapterOptions,
   ) {
-    const remoteChatOptions: RemoteChatOptions = {
-      consumerUrl: options.consumerUrl,
-      secret: options.secret,
-      timeoutMs: options.timeoutMs,
-      logger: options.logger,
-      fetch: options.fetch,
-    };
-    this.remoteChat = new RemoteChat(remoteChatOptions);
-    this.initializePromise = this.adapter.initialize(this.remoteChat);
+    this.initialized = adapter.initialize(
+      createRemoteChat({
+        consumerUrl: options.consumerUrl,
+        secret: options.secret,
+        timeoutMs: options.timeoutMs,
+        logger: options.logger,
+        fetch: options.fetch,
+      }),
+    );
+    // `ready` still surfaces the failure; this only stops an unobserved
+    // rejection from killing the process before a request arrives.
+    this.initialized.catch(() => {});
   }
 
   /** Resolves once the wrapped adapter's own initialize() has completed. */
   get ready(): Promise<void> {
-    return this.initializePromise;
+    return this.initialized;
   }
 
   async handleRequest(request: Request): Promise<Response> {
-    const verified = await verifyAndParse(request, this.options);
+    const verified = await verifyRequest(request, this.options);
     if (!verified.ok) return verified.response;
 
-    const id = verified.id ?? null;
+    const id = verified.id;
     if (typeof id !== "string" && typeof id !== "number") {
-      return jsonRpcError(
+      return failure(
         null,
         RpcErrorCode.INVALID_REQUEST,
         "Outbound calls must carry an id",
-      );
-    }
-
-    try {
-      await this.initializePromise;
-    } catch (error) {
-      const wireError = serializeError(error);
-      return jsonRpcError(
-        id,
-        wireError.code,
-        wireError.message,
-        wireError.data,
       );
     }
 
@@ -89,7 +86,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       params: verified.params,
     });
     if (!call.success) {
-      return jsonRpcError(
+      return failure(
         id,
         RpcErrorCode.METHOD_NOT_FOUND,
         `Unknown or invalid outbound method: ${verified.method}`,
@@ -97,16 +94,11 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
 
     try {
-      const result = await this.dispatch(call.data);
-      return jsonRpcSuccess(id, await encodeBuffers(result));
+      await this.initialized;
+      return success(id, await encode(await this.dispatch(call.data)));
     } catch (error) {
-      const wireError = serializeError(error);
-      return jsonRpcError(
-        id,
-        wireError.code,
-        wireError.message,
-        wireError.data,
-      );
+      const wire = serializeError(error);
+      return failure(id, wire.code, wire.message, wire.data);
     }
   }
 
@@ -114,66 +106,83 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     call: ReturnType<typeof OUTBOUND_CALLS.parse>,
   ): Promise<unknown> {
     const adapter = this.adapter;
-    // params was already validated against the schema above; the `as` casts
-    // below just recover the per-method types Zod already enforced.
-    const params = decodeBuffers(call.params) as unknown[];
+    const params = decode(call.params) as unknown[];
+    const threadId = params[0] as string;
+
     switch (call.method) {
       case "__handshake":
         return {
+          protocolVersion: PROTOCOL_VERSION,
           name: adapter.name,
           userName: adapter.userName,
           botUserId: adapter.botUserId,
+          lockScope: adapter.lockScope,
+          persistThreadHistory:
+            adapter.persistThreadHistory ?? adapter.persistMessageHistory,
+          supportsTurnCancellation: adapter.supportsTurnCancellation,
         };
       case "postMessage":
         return adapter.postMessage(
-          params[0] as string,
+          threadId,
           params[1] as AdapterPostableMessage,
         );
       case "editMessage":
         return adapter.editMessage(
-          params[0] as string,
+          threadId,
           params[1] as string,
           params[2] as AdapterPostableMessage,
         );
       case "deleteMessage":
-        return adapter.deleteMessage(params[0] as string, params[1] as string);
+        return adapter.deleteMessage(threadId, params[1] as string);
       case "addReaction":
         return adapter.addReaction(
-          params[0] as string,
+          threadId,
           params[1] as string,
           params[2] as string,
         );
       case "removeReaction":
         return adapter.removeReaction(
-          params[0] as string,
+          threadId,
           params[1] as string,
           params[2] as string,
         );
       case "fetchMessages":
-        return adapter.fetchMessages(
-          params[0] as string,
-          (params[1] ?? undefined) as Parameters<
-            typeof adapter.fetchMessages
-          >[1],
+        return this.serializeFetchResult(
+          await adapter.fetchMessages(
+            threadId,
+            (params[1] ?? undefined) as Parameters<
+              typeof adapter.fetchMessages
+            >[1],
+          ),
         );
       case "fetchThread":
-        return adapter.fetchThread(params[0] as string);
+        return adapter.fetchThread(threadId);
       case "startTyping":
         return adapter.startTyping(
-          params[0] as string,
+          threadId,
           (params[1] ?? undefined) as string | undefined,
           (params[2] ?? undefined) as Parameters<typeof adapter.startTyping>[2],
         );
       case "disconnect":
         if (typeof adapter.disconnect !== "function") {
-          const error = new Error(
+          throw new Error(
             `Adapter "${adapter.name}" does not implement disconnect()`,
           );
-          error.name = "MethodNotImplementedError";
-          throw error;
         }
         return adapter.disconnect();
     }
+  }
+
+  /** Real adapters return live Message instances here; they need the same treatment as inbound messages. */
+  private async serializeFetchResult(
+    result: FetchResult<TRawMessage>,
+  ): Promise<unknown> {
+    return {
+      ...result,
+      messages: await Promise.all(
+        result.messages.map((message) => serializeMessage(message as Message)),
+      ),
+    };
   }
 }
 

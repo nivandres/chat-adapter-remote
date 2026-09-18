@@ -3,8 +3,5 @@ export {
   serveAdapter,
   type ServeAdapterOptions,
 } from "./host/adapter-host";
-export {
-  RemoteChat,
-  RemoteChatUnsupportedMethodError,
-  type RemoteChatOptions,
-} from "./host/remote-chat";
+export { createRemoteChat, type RemoteChatOptions } from "./host/remote-chat";
+export { PROTOCOL_VERSION } from "./rpc/methods";

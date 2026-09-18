@@ -1,5 +1,4 @@
 node_modules
-*.lock*
 dist
 coverage
 examples/.baileys-auth

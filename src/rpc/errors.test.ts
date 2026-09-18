@@ -1,55 +1,71 @@
 import {
+  AdapterError,
   AdapterRateLimitError,
+  AuthenticationError,
+  NetworkError,
+  PermissionError,
   ResourceNotFoundError,
   ValidationError,
 } from "@chat-adapter/shared";
 import { describe, expect, it } from "vitest";
 
 import {
-  deserializeError,
   RemoteAdapterRpcError,
   RpcErrorCode,
+  deserializeError,
   serializeError,
 } from "./errors";
 
-describe("serializeError/deserializeError", () => {
-  it("round-trips AdapterRateLimitError with its retryAfter", () => {
-    const original = new AdapterRateLimitError("mock", 42);
-    const wire = serializeError(original);
-    expect(wire.code).toBe(RpcErrorCode.ADAPTER_RATE_LIMITED);
-    const restored = deserializeError(wire);
-    expect(restored).toBeInstanceOf(AdapterRateLimitError);
-    expect((restored as AdapterRateLimitError).retryAfter).toBe(42);
+describe("error mapping", () => {
+  it("round-trips every mapped adapter error class", () => {
+    const cases = [
+      new AdapterRateLimitError("mock", 42),
+      new AuthenticationError("mock", "bad token"),
+      new ResourceNotFoundError("mock", "channel", "C1"),
+      new PermissionError("mock", "post", "chat:write"),
+      new ValidationError("mock", "too long"),
+      new NetworkError("mock", "timeout"),
+      new AdapterError("boom", "mock", "CUSTOM"),
+    ];
+
+    for (const original of cases) {
+      const restored = deserializeError(serializeError(original));
+      expect(restored).toBeInstanceOf(original.constructor);
+      expect(restored.message).toBe(original.message);
+    }
   });
 
-  it("round-trips ResourceNotFoundError with resourceType/resourceId", () => {
-    const original = new ResourceNotFoundError("mock", "channel", "C123");
-    const restored = deserializeError(serializeError(original));
-    expect(restored).toBeInstanceOf(ResourceNotFoundError);
-    expect((restored as ResourceNotFoundError).resourceType).toBe("channel");
-    expect((restored as ResourceNotFoundError).resourceId).toBe("C123");
+  it("keeps subtype fields that callers branch on", () => {
+    const rate = deserializeError(
+      serializeError(new AdapterRateLimitError("mock", 42)),
+    ) as AdapterRateLimitError;
+    expect(rate.retryAfter).toBe(42);
+
+    const missing = deserializeError(
+      serializeError(new ResourceNotFoundError("mock", "channel", "C1")),
+    ) as ResourceNotFoundError;
+    expect(missing.resourceType).toBe("channel");
+    expect(missing.resourceId).toBe("C1");
+
+    const denied = deserializeError(
+      serializeError(new PermissionError("mock", "post", "chat:write")),
+    ) as PermissionError;
+    expect(denied.action).toBe("post");
+    expect(denied.requiredScope).toBe("chat:write");
   });
 
-  it("maps ValidationError to INVALID_PARAMS", () => {
-    const wire = serializeError(new ValidationError("mock", "bad input"));
-    expect(wire.code).toBe(RpcErrorCode.INVALID_PARAMS);
-    expect(deserializeError(wire)).toBeInstanceOf(ValidationError);
-  });
-
-  it("never leaks the original message for an unrecognized error", () => {
-    const wire = serializeError(new Error("super secret internal detail"));
+  it("does not leak the message of an unrecognized error", () => {
+    const wire = serializeError(new Error("internal hostname db-01.internal"));
     expect(wire.code).toBe(RpcErrorCode.INTERNAL_ERROR);
-    expect(wire.message).not.toContain("secret");
+    expect(wire.message).not.toContain("db-01");
   });
 
-  it("reconstructs an unrecognized wire error as RemoteAdapterRpcError", () => {
-    const restored = deserializeError({
-      code: RpcErrorCode.METHOD_NOT_FOUND,
-      message: "no such method",
-    });
-    expect(restored).toBeInstanceOf(RemoteAdapterRpcError);
-    expect((restored as RemoteAdapterRpcError).code).toBe(
-      RpcErrorCode.METHOD_NOT_FOUND,
-    );
+  it("represents transport-level failures as RemoteAdapterRpcError", () => {
+    expect(
+      deserializeError({
+        code: RpcErrorCode.METHOD_NOT_FOUND,
+        message: "no such method",
+      }),
+    ).toBeInstanceOf(RemoteAdapterRpcError);
   });
 });

@@ -1,19 +1,20 @@
 import { JsonRpcRequestSchema } from "./envelope";
 import { RpcErrorCode, type RpcErrorObject } from "./errors";
 import {
-  isTimestampFresh,
-  verify,
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
+  isTimestampFresh,
+  verify,
 } from "./signing";
 
 export interface DispatchOptions {
   secret: string;
-  replayWindowMs?: number;
+  /** Rejects requests whose signed timestamp is older than this. Default 30s. */
+  timestampToleranceMs?: number;
   maxBodyBytes?: number;
 }
 
-export type VerifyAndParseResult =
+export type VerifiedRequest =
   | {
       ok: true;
       id: string | number | null | undefined;
@@ -22,43 +23,52 @@ export type VerifyAndParseResult =
     }
   | { ok: false; response: Response };
 
-function errorResponse(
-  id: string | number | null,
-  status: number,
-  error: RpcErrorObject,
-): Response {
-  return Response.json({ jsonrpc: "2.0", id, error }, { status });
+function errorResponse(status: number, error: RpcErrorObject): Response {
+  return Response.json({ jsonrpc: "2.0", id: null, error }, { status });
+}
+
+/** Reads at most `maxBytes`, returning null past the limit rather than buffering the rest. */
+async function readBody(
+  request: Request,
+  maxBytes: number,
+): Promise<string | null> {
+  const declared = request.headers.get("content-length");
+  if (declared && Number(declared) > maxBytes) return null;
+  if (!request.body) {
+    const text = await request.text();
+    return Buffer.byteLength(text) > maxBytes ? null : text;
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
- * Shared by AdapterHost and RemoteAdapter.handleWebhook: checks body size,
- * signature, replay window, and the generic envelope shape. Stops short of
- * the method-specific allowlist (OUTBOUND_CALLS vs INBOUND_CALLS) — that's
- * the caller's job, since the two directions allow different methods.
+ * Shared by both directions: body size, signature, timestamp freshness, and
+ * the generic envelope. The method-specific allowlist is the caller's, since
+ * each direction accepts a different set.
  */
-export async function verifyAndParse(
+export async function verifyRequest(
   request: Request,
   options: DispatchOptions,
-): Promise<VerifyAndParseResult> {
-  const maxBodyBytes = options.maxBodyBytes ?? 5_000_000;
-  const replayWindowMs = options.replayWindowMs ?? 30_000;
-
-  const contentLength = request.headers.get("content-length");
-  if (contentLength && Number(contentLength) > maxBodyBytes) {
+): Promise<VerifiedRequest> {
+  const rawBody = await readBody(request, options.maxBodyBytes ?? 5_000_000);
+  if (rawBody === null) {
     return {
       ok: false,
-      response: errorResponse(null, 413, {
-        code: RpcErrorCode.INVALID_REQUEST,
-        message: "Payload too large",
-      }),
-    };
-  }
-
-  const rawBody = await request.text();
-  if (Buffer.byteLength(rawBody, "utf8") > maxBodyBytes) {
-    return {
-      ok: false,
-      response: errorResponse(null, 413, {
+      response: errorResponse(413, {
         code: RpcErrorCode.INVALID_REQUEST,
         message: "Payload too large",
       }),
@@ -67,30 +77,25 @@ export async function verifyAndParse(
 
   const signature = request.headers.get(SIGNATURE_HEADER);
   const timestamp = request.headers.get(TIMESTAMP_HEADER);
-  if (!signature || !timestamp) {
+  if (
+    !signature ||
+    !timestamp ||
+    !verify(rawBody, timestamp, signature, options.secret)
+  ) {
     return {
       ok: false,
-      response: errorResponse(null, 401, {
-        code: RpcErrorCode.UNAUTHORIZED,
-        message: "Missing signature",
-      }),
-    };
-  }
-  if (!verify(rawBody, timestamp, signature, options.secret)) {
-    return {
-      ok: false,
-      response: errorResponse(null, 401, {
+      response: errorResponse(401, {
         code: RpcErrorCode.UNAUTHORIZED,
         message: "Invalid signature",
       }),
     };
   }
-  if (!isTimestampFresh(timestamp, replayWindowMs)) {
+  if (!isTimestampFresh(timestamp, options.timestampToleranceMs ?? 30_000)) {
     return {
       ok: false,
-      response: errorResponse(null, 401, {
-        code: RpcErrorCode.REPLAY_REJECTED,
-        message: "Request timestamp outside the allowed window",
+      response: errorResponse(401, {
+        code: RpcErrorCode.STALE_TIMESTAMP,
+        message: "Timestamp outside tolerance",
       }),
     };
   }
@@ -101,7 +106,7 @@ export async function verifyAndParse(
   } catch {
     return {
       ok: false,
-      response: errorResponse(null, 400, {
+      response: errorResponse(400, {
         code: RpcErrorCode.PARSE_ERROR,
         message: "Invalid JSON",
       }),
@@ -112,17 +117,12 @@ export async function verifyAndParse(
   if (!envelope.success) {
     return {
       ok: false,
-      response: errorResponse(null, 400, {
+      response: errorResponse(400, {
         code: RpcErrorCode.INVALID_REQUEST,
         message: "Invalid JSON-RPC envelope",
       }),
     };
   }
-
-  return {
-    ok: true,
-    id: envelope.data.id,
-    method: envelope.data.method,
-    params: envelope.data.params,
-  };
+  const { id, method, params } = envelope.data;
+  return { ok: true, id, method, params };
 }
