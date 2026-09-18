@@ -6,6 +6,9 @@ Hardening pass driven by running 0.2.0 against a real WhatsApp adapter, plus the
 
 ### Fixed
 
+- Modal submits and options loads queued behind inbound message forwards, so a backlog could push them past the few seconds the platform allows before the user sees a connection error. They no longer go through the forward limiter: they are paced by a human clicking and cannot flood it.
+- The consumer returned the answer to those two without running it through the codec, the one place a value crossed the wire uncoded.
+- A stream abandoned mid-flight was only reclaimed by a later stream call, so a consumer that lost its connection could leave the adapter blocked on an iterable that never ended. A sweep now runs while streams are open, unref'd so it never holds the process alive.
 - Missing `secret`, `url` or `consumerUrl` crashed on the first request with `The "key" argument must be of type string` or `Failed to parse URL from undefined`, neither of which names the missing option. Both sides now fail at construction saying which one it is.
 - Every request rejected before it was parsed — bad signature, oversized body, malformed JSON — reached the caller as `response id did not match request`. Those answer with `id: null` per JSON-RPC, and the client matched the id before reading the error, so the real reason was never visible. The error is now read first.
 - The host sanitises adapter errors on the wire but did not log them locally either, so a failing call left no trace on either side. The host now logs the original error before sanitising it.

@@ -100,7 +100,11 @@ At-most-once. No retry, queue, or deduplication: a failed forward is logged and 
 
 Chat core serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers. That is core behavior rather than the bridge — distinct threads all run — but it matters here because a host draining a backlog after a reconnect sends exactly that shape of burst. Set a `queue` concurrency strategy on the consumer's `Chat` if you need every message.
 
-Attachment bytes are inlined as base64 and counted against `maxBodyBytes`. Larger media needs out-of-band transfer.
+Attachment bytes are inlined as base64, so the effective media ceiling is `maxBodyBytes` divided by about 1.33. The 5 MB default is ours, chosen as a memory guard rather than a protocol limit — the body is buffered before dispatch, so the real cost is that much RAM per concurrent request. Raise it on **both** sides, since each has its own option; raising only one gives a confusing 413. Your host may cap request bodies below whatever you set, so check it before tuning.
+
+For media past that, point at it instead of inlining it: an attachment with a `url` is fetched by the platform directly and never touches the bridge. Inbound never inlines — the host sends metadata and the consumer rebuilds a `fetchData()` that pulls the bytes on demand, one round trip per attachment.
+
+Inbound methods are additive: a newer host may send an event an older consumer does not know, which is answered with a validation error and logged on both sides rather than dropping the connection. The protocol version only changes when the shape of an existing call does, and a mismatch there refuses to initialize.
 
 ## Security
 
