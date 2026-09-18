@@ -352,6 +352,43 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
       params: z.tuple([ThreadId]),
     })
     .strict(),
+  // Answered rather than acknowledged: the platform waits for the reply.
+  z
+    .object({
+      method: z.literal("processModalSubmit"),
+      id: Id,
+      params: z.tuple([Loose, z.string().nullish()]),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal("processOptionsLoad"),
+      id: Id,
+      params: z.tuple([Loose]),
+    })
+    .strict(),
+  z
+    .object({
+      method: z.literal("processModalClose"),
+      id: Id,
+      params: z.tuple([Loose, z.string().nullish()]),
+    })
+    .strict(),
+  ...(
+    [
+      "processAgentSessionStopped",
+      "processAgentSessionTitleChanged",
+      "processAppHomeOpened",
+      "processAppContextChanged",
+      "processAssistantThreadStarted",
+      "processAssistantContextChanged",
+      "processMemberJoinedChannel",
+    ] as const
+  ).map((method) =>
+    z
+      .object({ method: z.literal(method), id: Id, params: z.tuple([Loose]) })
+      .strict(),
+  ),
   z
     .object({
       method: z.literal("log"),
@@ -365,6 +402,12 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
     })
     .strict(),
 ]);
+
+/** Inbound calls whose answer the host has to relay back to the platform. */
+export const ANSWERED_EVENTS = [
+  "processModalSubmit",
+  "processOptionsLoad",
+] as const;
 
 /** Event payload keys that can carry a serialized `Message`. */
 export const EVENT_MESSAGE_KEYS = ["message", "previousMessage"] as const;
