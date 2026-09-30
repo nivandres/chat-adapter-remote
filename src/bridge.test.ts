@@ -282,7 +282,11 @@ describe("handshake", () => {
     await handshake(b);
 
     for (const name of OPTIONAL_CAPABILITIES) {
-      const implemented = name === "reply" || typeof plain[name] === "function";
+      // `stream` is always announced: without a native one the host buffers.
+      const implemented =
+        name === "reply" ||
+        name === "stream" ||
+        typeof plain[name] === "function";
       expect({ name, bridged: typeof b.remote[name] === "function" }).toEqual({
         name,
         bridged: implemented,

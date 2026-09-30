@@ -15,7 +15,7 @@ import {
   type AdapterHost,
   type ServeAdapterOptions,
 } from "../host";
-import type { FetchLike } from "../types";
+import type { FetchLike, RemoteAdapterConfig } from "../types";
 
 export const SECRET =
   "8f2a1c9e4b7d0a6538e1c4f9b2d7a05c3e6f81b4d9a2c705e8f3b6d1a4c7e092";
@@ -62,6 +62,7 @@ export interface Bridge {
 export function bridge(
   overrides: Partial<Adapter> = {},
   hostOptions: Partial<ServeAdapterOptions> = {},
+  consumerOptions: Partial<RemoteAdapterConfig> = {},
 ): Bridge {
   let captured: ChatInstance | undefined;
   const adapter = createMockAdapter("mock", {
@@ -91,6 +92,7 @@ export function bridge(
     secret: SECRET,
     name: "mock",
     fetch: loopback,
+    ...consumerOptions,
   });
   chat = new Chat({
     userName: "mock-bot",

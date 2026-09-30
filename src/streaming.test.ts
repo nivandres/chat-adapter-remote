@@ -1,6 +1,7 @@
 import type { StreamChunk } from "chat";
 import { describe, expect, it, vi } from "vitest";
 
+import { StreamDiscardedError } from "./rpc/errors";
 import { bridge, handshake, type Bridge } from "./testing/bridge";
 
 const THREAD = "mock:general:1";
@@ -65,7 +66,7 @@ describe("streaming", () => {
   it("sends the first chunk immediately and coalesces the rest", async () => {
     const b = streamingBridge(async (_threadId, chunks) => {
       for await (const _chunk of chunks) void _chunk;
-      return null;
+      return { id: "streamed", threadId: THREAD, raw: {} };
     });
     await handshake(b);
     const pushes: number[] = [];
@@ -91,7 +92,7 @@ describe("streaming", () => {
     const seen: string[] = [];
     const b = streamingBridge(async (_threadId, chunks) => {
       for await (const chunk of chunks) seen.push(chunk as string);
-      return null;
+      return { id: "streamed", threadId: THREAD, raw: {} };
     });
     await handshake(b);
 
@@ -107,7 +108,7 @@ describe("streaming", () => {
     expect(seen).toEqual(["before the pause", "after the pause"]);
   });
 
-  it("stops reading and returns null once the turn is aborted", async () => {
+  it("stops reading once the turn is aborted and lets the adapter decide", async () => {
     const b = streamingBridge(async (_threadId, chunks) => {
       for await (const _chunk of chunks) void _chunk;
       return { id: "partial", threadId: THREAD, raw: {} };
@@ -129,27 +130,74 @@ describe("streaming", () => {
       { signal: controller.signal },
     );
 
-    expect(result).toBeNull();
+    // Native mode: the adapter got the abort and decides what it posts.
+    expect(result).toMatchObject({ id: "partial" });
     // `for await` cannot cancel a pull already in flight, so one more chunk is
     // read after the abort; the rest is left alone.
     expect(state.pulled).toBe(2);
   });
 
-  it("forwards stream options but never the abort signal", async () => {
-    const seen: unknown[] = [];
+  it("forwards stream options and gives the adapter a signal of its own", async () => {
+    const seen: Array<{ recipientUserId?: string; signal?: AbortSignal }> = [];
     const b = streamingBridge(async (_threadId, chunks, options) => {
-      seen.push(options);
+      seen.push(options as never);
+      for await (const _chunk of chunks) void _chunk;
+      return { id: "streamed", threadId: THREAD, raw: {} };
+    });
+    await handshake(b);
+    const consumerSignal = new AbortController().signal;
+
+    await b.remote.stream!(THREAD, source(["a"]).iterable, {
+      recipientUserId: "u1",
+      signal: consumerSignal,
+    });
+
+    expect(seen[0]!.recipientUserId).toBe("u1");
+    // The consumer's signal cannot cross the wire; the host makes its own.
+    expect(seen[0]!.signal).toBeInstanceOf(AbortSignal);
+    expect(seen[0]!.signal).not.toBe(consumerSignal);
+  });
+
+  it("aborts the adapter's signal when the turn is cut off", async () => {
+    let signal!: AbortSignal;
+    const b = streamingBridge(async (_threadId, chunks, options) => {
+      signal = (options as { signal: AbortSignal }).signal;
       for await (const _chunk of chunks) void _chunk;
       return null;
     });
     await handshake(b);
+    const controller = new AbortController();
 
-    await b.remote.stream!(THREAD, source(["a"]).iterable, {
-      recipientUserId: "u1",
-      signal: new AbortController().signal,
+    await expect(
+      b.remote.stream!(
+        THREAD,
+        {
+          async *[Symbol.asyncIterator]() {
+            yield "partial";
+            controller.abort();
+            yield "never";
+          },
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toBeInstanceOf(StreamDiscardedError);
+
+    // Before this the adapter saw the iterable end exactly as it would on success.
+    expect(signal.aborted).toBe(true);
+  });
+
+  it("leaves the signal alone when the stream finishes normally", async () => {
+    let signal!: AbortSignal;
+    const b = streamingBridge(async (_threadId, chunks, options) => {
+      signal = (options as { signal: AbortSignal }).signal;
+      for await (const _chunk of chunks) void _chunk;
+      return { id: "done", threadId: THREAD, raw: {} };
     });
+    await handshake(b);
 
-    expect(seen[0]).toEqual({ recipientUserId: "u1" });
+    await b.remote.stream!(THREAD, source(["a", "b"]).iterable);
+
+    expect(signal.aborted).toBe(false);
   });
 
   it("surfaces a failure the adapter raises, before or during the stream", async () => {
