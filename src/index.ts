@@ -4,7 +4,11 @@ export {
   createRemoteAdapter,
   type RemoteOf,
 } from "./adapter";
-export { RemoteAdapterRpcError, RpcErrorCode } from "./rpc/errors";
+export {
+  RemoteAdapterRpcError,
+  RpcErrorCode,
+  StreamDiscardedError,
+} from "./rpc/errors";
 export { PROTOCOL_VERSION } from "./rpc/methods";
 export { createReplayGuard, type ReplayGuard } from "./rpc/security";
-export type { RemoteAdapterConfig } from "./types";
+export type { HostEvent, HostStateAccess, RemoteAdapterConfig } from "./types";

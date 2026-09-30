@@ -54,6 +54,17 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         body,
         signal: controller.signal,
       });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new RemoteAdapterRpcError(
+          RpcErrorCode.TIMEOUT,
+          `chat-adapter-remote: ${method} got no answer within ${timeoutMs}ms`,
+        );
+      }
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.UNAVAILABLE,
+        `chat-adapter-remote: ${options.url} is unreachable (${(error as Error).message})`,
+      );
     } finally {
       clearTimeout(timer);
     }
@@ -63,8 +74,6 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     async request(method, params) {
       const id = nextId++;
       const response = await send(method, params, id);
-      // Bounded like a request: a deferred attachment is fetched through here,
-      // and the whole point of deferring it was that it did not fit a body.
       const text = await readBody(response, maxBodyBytes);
       if (text === null) {
         throw new RemoteAdapterRpcError(
@@ -76,16 +85,25 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       try {
         parsed = JSON.parse(text);
       } catch {
+        parsed = undefined;
+      }
+      // Never handled, so the one case a caller can safely retry.
+      if (response.status >= 500) {
+        const reason = (parsed as { error?: { message?: string } } | undefined)
+          ?.error?.message;
+        throw new RemoteAdapterRpcError(
+          RpcErrorCode.UNAVAILABLE,
+          `chat-adapter-remote: ${method} answered HTTP ${response.status}${reason ? ` (${reason})` : ""}`,
+        );
+      }
+      if (parsed === undefined) {
         throw new RemoteAdapterRpcError(
           RpcErrorCode.INTERNAL_ERROR,
           `chat-adapter-remote: non-JSON response (HTTP ${response.status})`,
         );
       }
       const envelope = JsonRpcResponseSchema.parse(parsed);
-      // Read the error before matching the id: a request rejected before it
-      // was parsed (bad signature, oversized body, malformed JSON) answers
-      // with `id: null` per JSON-RPC, and matching first would report every
-      // one of those as an id mismatch instead of the actual reason.
+      // Pre-parse rejections answer with `id: null`, so read the error first.
       if (isErrorResponse(envelope)) throw deserializeError(envelope.error);
       if (envelope.id !== id) {
         throw new RemoteAdapterRpcError(

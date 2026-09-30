@@ -6,21 +6,14 @@ import { decode, encode } from "./codec";
 
 type SerializedMessage = Parameters<typeof MessageClass.fromJSON>[0];
 
-/** Tag the consumer reads to know it has to fetch the bytes rather than decode them. */
 export const ATTACHMENT_REF = "__charAttachment";
 
-/** Normalised on the way out, so everything downstream handles one shape. */
 export type AttachmentBytes = Buffer;
 
 export interface AttachmentPolicy {
   budget: AttachmentBudget;
   registry: AttachmentRegistry;
-  /**
-   * Whether the adapter can rebuild an attachment from its own
-   * `fetchMetadata`. When it can, deferring needs nothing kept here: the
-   * consumer asks for the helper and the adapter rebuilds it, which survives
-   * a host restart and never expires.
-   */
+  /** The adapter can rebuild it from `fetchMetadata`, so nothing needs holding here. */
   rehydratable: boolean;
 }
 
@@ -45,12 +38,7 @@ function read(
   };
 }
 
-/**
- * `Message.toJSON()` omits attachment `data`/`fetchData`, since a closure
- * cannot survive JSON, so the bytes have to be carried deliberately: inlined
- * when they fit, otherwise left here behind an id the consumer can fetch.
- * An attachment the adapter gave no way to read is forwarded as metadata.
- */
+/** `toJSON()` drops `data`/`fetchData`, so bytes are inlined when they fit or held behind an id. */
 export async function serializeMessage(
   message: Message,
   policy?: AttachmentPolicy,
@@ -68,7 +56,6 @@ export async function serializeMessage(
     }
 
     const defer = (read: () => Promise<AttachmentBytes>) => {
-      // The adapter's own mechanism wins: nothing is held, so nothing expires.
       if (policy!.rehydratable && attachment.fetchMetadata) {
         attachments.push(base);
         return;
@@ -79,8 +66,7 @@ export async function serializeMessage(
       });
     };
 
-    // Deferring on the reported size alone means an oversized attachment is
-    // never downloaded here at all.
+    // Deciding on the reported size means an oversized attachment is never downloaded here.
     if (policy && !policy.budget.allows(attachment.size)) {
       defer(resolve);
       continue;
@@ -103,10 +89,6 @@ export async function serializeMessage(
   return encode({ ...serialized, attachments });
 }
 
-/**
- * Builds the way to read an attachment whose bytes did not travel with it,
- * or returns undefined when there is no way to reach them.
- */
 export type AttachmentResolver = (
   wired: WireAttachment,
 ) => (() => Promise<AttachmentBytes>) | undefined;
@@ -122,8 +104,7 @@ export function deserializeMessage(
 
   message.attachments = message.attachments.map((attachment, index) => {
     const wired = decoded.attachments?.[index];
-    // `fetchData` is what the SDK reads: `toAiMessages` drops an image that
-    // only carries `data`, and rehydration keys off its absence.
+    // The SDK reads `fetchData`: `toAiMessages` drops an image that only has `data`.
     const data = wired?.data;
     if (data) return { ...attachment, data, fetchData: async () => data };
 

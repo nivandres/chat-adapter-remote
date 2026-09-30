@@ -32,7 +32,12 @@ import { ConsoleLogger, getEmoji } from "chat";
 
 import { decode, encode } from "./rpc/codec";
 import { verifyRequest } from "./rpc/dispatch";
-import { RpcErrorCode, serializeError } from "./rpc/errors";
+import {
+  RemoteAdapterRpcError,
+  RpcErrorCode,
+  isTransient,
+  serializeError,
+} from "./rpc/errors";
 import {
   ATTACHMENT_REF,
   deserializeMessage,
@@ -44,12 +49,15 @@ import {
   INBOUND_CALLS,
   OPTIONAL_CAPABILITIES,
   PROTOCOL_VERSION,
+  SCOPED_STATE_OPERATIONS,
+  type StateOperation,
 } from "./rpc/methods";
 import { createReplayGuard, type ReplayGuard } from "./rpc/security";
 import { createRpcClient, type RpcClient } from "./rpc/transport";
-import type { RemoteAdapterConfig } from "./types";
+import { translateIds, translateParams } from "./thread-ids";
+import type { HostEvent, RemoteAdapterConfig } from "./types";
 
-/** Thrown by the synchronous `Adapter` members, which cannot be answered over RPC. Chat core never calls these on an adapter it holds. */
+/** Thrown by the synchronous `Adapter` members, which a round trip cannot answer. */
 export class RemoteAdapterUnsupportedSyncMethodError extends Error {
   constructor(method: string) {
     super(
@@ -65,17 +73,11 @@ interface ThreadFacts {
   channelVisibility?: ChannelVisibility;
 }
 
-/** Every inbound call except `log`, which is a notification and answered separately. */
 type InboundEvent = Exclude<
   ReturnType<typeof INBOUND_CALLS.parse>,
   { method: "log" }
 >;
 
-/**
- * A missing secret would mean accepting unsigned calls, and a missing url
- * would mean dropping every message; both are deployment mistakes worth
- * failing on at startup rather than on the first request.
- */
 function requireOption(value: string | undefined, option: string): string {
   if (!value) {
     const variable = option === "url" ? "URL" : "SECRET";
@@ -87,13 +89,12 @@ function requireOption(value: string | undefined, option: string): string {
   return value;
 }
 
-/** Either the host is consuming, or it already finished without reading. */
 type StreamStart =
   { streamId: string } | { done: true; result: RawMessage<unknown> | null };
 
 const DEFAULT_THREAD_CACHE = 1000;
+const THREAD_FACTS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** `signal` is watched locally and never sent. */
 function toWireStreamOptions(
   options?: StreamOptions,
 ): Record<string, unknown> | undefined {
@@ -102,7 +103,7 @@ function toWireStreamOptions(
   return rest;
 }
 
-/** The consumer-side stand-in, registered on a real `Chat` like any other adapter. */
+/** The consumer-side stand-in, registered on a real `Chat`. */
 export class RemoteAdapter<
   TThreadId = unknown,
   TRawMessage = unknown,
@@ -116,9 +117,14 @@ export class RemoteAdapter<
 
   private chat: ChatInstance | null = null;
   private readonly rpc: RpcClient;
+  private readonly link: RpcClient;
   private readonly logger: Logger;
   private readonly replayGuard: ReplayGuard;
   private readonly secret: string;
+  private handshaken = false;
+  private hostName?: string;
+  private streams = true;
+  private handshaking?: Promise<void>;
   private readonly threads = new Map<string, ThreadFacts>();
   private readonly maxCachedThreads: number;
 
@@ -137,29 +143,56 @@ export class RemoteAdapter<
       config.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
     this.maxCachedThreads = config.maxCachedThreads ?? DEFAULT_THREAD_CACHE;
     this.replayGuard = config.replayGuard ?? createReplayGuard();
-    this.rpc = createRpcClient({
+    this.link = createRpcClient({
       url,
       secret: this.secret,
       timeoutMs: config.timeoutMs,
       fetch: config.fetch,
     });
+    this.rpc = {
+      request: async (method, params) => {
+        await this.handshake();
+        const result = await this.link.request(method, this.outward(params));
+        return this.inward(method, result);
+      },
+      notify: (method, params) => this.link.notify(method, params),
+    };
   }
 
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
+    await this.preloadThreads();
+    try {
+      await this.handshake();
+    } catch (error) {
+      // Unreachable may clear on its own; a wrong secret or protocol will not.
+      if (!isTransient(error)) throw error;
+      this.logger.warn("host unreachable, will retry on the next call", {
+        error,
+      });
+      this.config.onError?.(error, { method: "__handshake" });
+    }
+  }
+
+  /** Chat keeps its first init promise forever, so a failure here must not be remembered. */
+  private async handshake(): Promise<void> {
+    if (this.handshaken) return;
+    this.handshaking ??= this.negotiate().finally(() => {
+      this.handshaking = undefined;
+    });
+    await this.handshaking;
+  }
+
+  private async negotiate(): Promise<void> {
     const handshake = HandshakeSchema.parse(
-      await this.rpc.request("__handshake", []),
+      await this.link.request("__handshake", []),
     );
     if (handshake.protocolVersion !== PROTOCOL_VERSION) {
       throw new Error(
         `chat-adapter-remote: protocol mismatch, host speaks v${handshake.protocolVersion} and this consumer speaks v${PROTOCOL_VERSION}`,
       );
     }
-    if (handshake.name !== this.name) {
-      this.logger.warn(
-        `host adapter is named "${handshake.name}" but this adapter is registered as "${this.name}"`,
-      );
-    }
+    this.hostName = handshake.name;
     if (!this.config.userName) this.userName = handshake.userName;
     this.botUserId = handshake.botUserId;
     this.lockScope = handshake.lockScope;
@@ -167,18 +200,20 @@ export class RemoteAdapter<
     this.supportsTurnCancellation = handshake.supportsTurnCancellation;
     this.applyCapabilities(handshake.capabilities);
     this.applyCustomMethods(handshake.customMethods);
+    this.handshaken = true;
   }
 
-  /** Chat decides what an adapter can do with `adapter.x?.()`, so anything the host did not report is removed from this instance. */
+  /** Chat checks `adapter.x?.()`, so what the host did not report is removed. */
   private applyCapabilities(capabilities?: string[]): void {
     if (!capabilities) return;
     const supported = new Set(capabilities);
+    this.streams = supported.has("stream");
     for (const name of OPTIONAL_CAPABILITIES) {
       if (!supported.has(name)) Reflect.set(this, name, undefined);
     }
   }
 
-  /** Never replaces something this adapter already has, so the host cannot redefine the interface. */
+  /** Never replaces an existing member, so the host cannot redefine the interface. */
   private applyCustomMethods(names?: string[]): void {
     for (const name of names ?? []) {
       if (name in this) continue;
@@ -188,15 +223,89 @@ export class RemoteAdapter<
     }
   }
 
+  /** The host may call before this side reached it, so its name is resolved here too. */
+  private async inbound(method: string, params: unknown): Promise<unknown> {
+    if (method === "state" || method === "log" || !Array.isArray(params)) {
+      return params;
+    }
+    await this.handshake().catch((error: unknown) => {
+      this.logger.warn("could not name the host; ids pass through as sent", {
+        error,
+      });
+    });
+    return this.hostName
+      ? translateParams(params, this.hostName, this.name)
+      : params;
+  }
+
+  private outward(params: unknown): unknown {
+    if (!this.hostName || !Array.isArray(params)) return params;
+    return translateParams(params, this.name, this.hostName);
+  }
+
+  private inward(method: string, result: unknown): unknown {
+    if (!this.hostName) return result;
+    if (method === "openDM" && typeof result === "string") {
+      return translateParams([result], this.hostName, this.name)[0];
+    }
+    return translateIds(result, this.hostName, this.name);
+  }
+
   private rememberThread(threadId: string, facts: ThreadFacts): void {
-    // Bounded: insertion order makes the oldest entry the first key.
+    const known = this.threads.get(threadId);
+    // Insertion order makes the oldest entry the first key.
     this.threads.delete(threadId);
     while (this.threads.size >= this.maxCachedThreads)
       this.threads.delete(this.threads.keys().next().value!);
     this.threads.set(threadId, facts);
+    if (!known || JSON.stringify(known) !== JSON.stringify(facts)) {
+      void this.persistThread(threadId, facts, !known);
+    }
   }
 
-  /** Answered from facts the host sends with each inbound message. */
+  /** `isDM` is synchronous, so another instance can only answer it from what was loaded ahead. */
+  private async persistThread(
+    threadId: string,
+    facts: ThreadFacts,
+    isNew: boolean,
+  ): Promise<void> {
+    try {
+      const state = this.chat?.getState();
+      if (!state) return;
+      await state.set(this.threadKey(threadId), facts, THREAD_FACTS_TTL_MS);
+      if (isNew) {
+        await state.appendToList(this.recentThreadsKey, threadId, {
+          maxLength: this.maxCachedThreads,
+        });
+      }
+    } catch (error) {
+      this.logger.debug("could not persist thread facts", { threadId, error });
+    }
+  }
+
+  private async preloadThreads(): Promise<void> {
+    try {
+      const state = this.chat?.getState();
+      if (!state) return;
+      const recent = await state.getList<string>(this.recentThreadsKey);
+      for (const threadId of recent.slice(-this.maxCachedThreads)) {
+        if (this.threads.has(threadId)) continue;
+        const facts = await state.get<ThreadFacts>(this.threadKey(threadId));
+        if (facts) this.threads.set(threadId, facts);
+      }
+    } catch (error) {
+      this.logger.warn("could not preload thread facts", { error });
+    }
+  }
+
+  private threadKey(threadId: string): string {
+    return `remote:${this.name}:thread:${threadId}`;
+  }
+
+  private get recentThreadsKey(): string {
+    return `remote:${this.name}:threads`;
+  }
+
   channelIdFromThreadId(threadId: string): string {
     return (
       this.threads.get(threadId)?.channelId ??
@@ -299,7 +408,6 @@ export class RemoteAdapter<
     ]);
   }
 
-  /** Rebuilds a message, wiring any attachment the host kept back to a fetch. */
   private rebuild(wire: unknown): Message {
     return deserializeMessage(wire, (wired) => {
       const held = wired[ATTACHMENT_REF];
@@ -315,8 +423,6 @@ export class RemoteAdapter<
           return pending;
         };
       }
-      // No bytes and no id: readable only if the host's adapter can rebuild it
-      // from the metadata it sent, which the handshake already told us.
       if (!wired.fetchMetadata || !this.rehydrateAttachment) return undefined;
       return () =>
         this.rpc.request("rehydrateAttachment", [wired]) as Promise<Buffer>;
@@ -493,16 +599,20 @@ export class RemoteAdapter<
     await this.rpc.request("endTyping", [threadId, status]);
   }
 
-  /**
-   * An AsyncIterable cannot be an RPC argument, so the stream is opened, pushed
-   * to in batches, then closed. When the host's adapter declines to stream this
-   * returns without touching `textStream`, which Chat's own fallback re-reads.
-   */
+  /** Declining before reading leaves `textStream` for Chat's own fallback, which re-reads it. */
   async stream(
     threadId: string,
     textStream: AsyncIterable<string | StreamChunk>,
     options?: StreamOptions,
   ): Promise<RawMessage<TRawMessage> | null> {
+    try {
+      await this.handshake();
+    } catch (error) {
+      if (isTransient(error)) return null;
+      throw error;
+    }
+    if (!this.streams) return null;
+
     const start = (await this.rpc.request("streamStart", [
       threadId,
       toWireStreamOptions(options),
@@ -517,8 +627,7 @@ export class RemoteAdapter<
     let pump: Promise<void> | undefined;
     let failure: unknown;
 
-    // One push in flight at a time, so the first chunk leaves immediately and
-    // batching follows the round trip rather than a fixed interval.
+    // One push in flight: batching follows the round trip, not a fixed interval.
     const drain = async (): Promise<void> => {
       while (batch.length > 0) {
         const chunks = batch;
@@ -597,12 +706,11 @@ export class RemoteAdapter<
     await this.rpc.request("disconnect", []);
   }
 
-  /** Receives the events the host forwards, acknowledging as soon as one is accepted. */
   async handleWebhook(
     request: Request,
     options?: WebhookOptions,
   ): Promise<Response> {
-    // Nothing here may throw past this point; the caller is a webhook route.
+    // An unhandled rejection here would end the process.
     try {
       return await this.receive(request, options);
     } catch (error) {
@@ -629,7 +737,7 @@ export class RemoteAdapter<
     const call = INBOUND_CALLS.safeParse({
       method: verified.method,
       id: verified.id,
-      params: verified.params,
+      params: await this.inbound(verified.method, verified.params),
     });
     if (!call.success) {
       this.logger.error("rejected inbound call", {
@@ -649,6 +757,15 @@ export class RemoteAdapter<
       );
     }
 
+    if (call.data.method === "hostEvent") {
+      try {
+        this.config.onEvent?.(decode(call.data.params[0]) as HostEvent);
+      } catch (error) {
+        this.report(error, "hostEvent");
+      }
+      return new Response(null, { status: 204 });
+    }
+
     if (call.data.method === "log") {
       const [level, prefix, message, args] = call.data.params;
       this.chat?.getLogger(prefix || undefined)[level](message, ...args);
@@ -657,7 +774,7 @@ export class RemoteAdapter<
 
     const chat = this.chat;
     if (!chat) {
-      // Acknowledging would drop it: the host takes 200 as delivered.
+      // A 200 would tell the host it was delivered.
       this.logger.error("inbound call arrived before initialize()", {
         method: call.data.method,
       });
@@ -682,28 +799,61 @@ export class RemoteAdapter<
         result: (await encode(answer)) ?? null,
       });
     } catch (error) {
+      // A refusal of ours is an answer; a 5xx tells the host it may send again.
       const wireError = serializeError(error);
       return Response.json(
         { jsonrpc: "2.0", id: call.data.id, error: wireError },
-        { status: 500 },
+        { status: error instanceof RemoteAdapterRpcError ? 200 : 500 },
       );
     }
   }
 
-  /** Handlers run under the caller's `waitUntil`, so work is started rather than awaited; an unhandled rejection would end the process. */
   private detach(work: unknown, method: string): void {
     void Promise.resolve(work).catch((error: unknown) =>
       this.report(error, method),
     );
   }
 
-  /** The consumer usually runs where no debugger can be attached, so failures have to be routable. */
   private report(error: unknown, method: string): void {
     this.logger.error(`inbound ${method} failed`, { error });
     this.config.onError?.(error, { method });
   }
 
-  /** Rebuilds what the host had to strip: dates, buffers, messages, the emoji singleton, and this adapter. */
+  /** Scoped keys are prefixed here, never trusted from the wire. */
+  private runStateOperation(
+    chat: ChatInstance,
+    operation: StateOperation,
+    args: unknown[],
+  ): Promise<unknown> {
+    const access = this.config.hostState ?? "scoped";
+    // Lending nothing tells the host to use its own store; a narrower scope refuses the call.
+    if (access === "off") {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.STATE_UNAVAILABLE,
+        "chat-adapter-remote: this consumer does not lend its state",
+      );
+    }
+    if (
+      access === "scoped" &&
+      !(SCOPED_STATE_OPERATIONS as readonly string[]).includes(operation)
+    ) {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.METHOD_NOT_IMPLEMENTED,
+        `chat-adapter-remote: state access is scoped, so ${operation} is not available`,
+      );
+    }
+
+    const store = chat.getState() as unknown as Record<
+      string,
+      (...a: unknown[]) => Promise<unknown>
+    >;
+    const scoped =
+      access === "scoped"
+        ? [`adapter:${this.name}:${String(args[0])}`, ...args.slice(1)]
+        : args;
+    return store[operation]!(...scoped);
+  }
+
   private event<T>(payload: Record<string, unknown>): T {
     const restored: Record<string, unknown> = {
       ...(decode(payload) as Record<string, unknown>),
@@ -767,14 +917,8 @@ export class RemoteAdapter<
           call.method,
         );
         return;
-      case "state": {
-        const [operation, args] = call.params;
-        const store = chat.getState() as unknown as Record<
-          string,
-          (...a: unknown[]) => Promise<unknown>
-        >;
-        return store[operation]!(...args);
-      }
+      case "state":
+        return this.runStateOperation(chat, call.params[0], call.params[1]);
       case "abortTurn":
         this.detach(chat.abortTurn(call.params[0]), call.method);
         return;
@@ -800,7 +944,7 @@ export class RemoteAdapter<
           call.method,
         );
         return;
-      // Awaited, not detached: the host is relaying the answer to the platform.
+      // Awaited: the platform is waiting on this answer.
       case "processModalSubmit":
         return chat.processModalSubmit(
           this.event(call.params[0]),
@@ -816,7 +960,7 @@ export class RemoteAdapter<
 type ThreadIdOf<A> = A extends Adapter<infer T, infer _R> ? T : unknown;
 type RawMessageOf<A> = A extends Adapter<infer _T, infer R> ? R : unknown;
 
-/** What is left once the interface is removed. Crossing the wire makes every one of them async. */
+/** Crossing the wire makes every custom method async. */
 type CustomOf<A> = {
   [
     K in keyof A as K extends keyof Adapter

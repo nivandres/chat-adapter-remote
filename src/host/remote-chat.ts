@@ -9,14 +9,25 @@ import type {
 } from "chat";
 import { ConsoleLogger } from "chat";
 
+import { encode } from "../rpc/codec";
+import {
+  RemoteAdapterRpcError,
+  RpcErrorCode,
+  isTransient,
+  isUndelivered,
+} from "../rpc/errors";
 import { serializeMessage, type AttachmentPolicy } from "../rpc/message-wire";
 import { EVENT_MESSAGE_KEYS } from "../rpc/methods";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
 import { createBridgingLogger, type LogLevel } from "./logger-bridge";
-import { createRemoteState } from "./state";
+import {
+  forwardEntry,
+  type DroppedForwardHandler,
+  type QueuedForward,
+} from "./delivery";
+import { createLocalState, createRemoteState } from "./state";
 import type { FetchLike } from "../types";
 
-/** Where a failure happened, so callers can route it without parsing messages. */
 export type HostErrorPhase =
   "initialize" | "forward" | "dispatch" | "shutdown" | "adapter";
 
@@ -39,9 +50,9 @@ export interface RemoteChatOptions {
   onError?: HostErrorHandler;
   /** Answers `getUserName()`, which cannot be asked of the consumer synchronously. */
   userName?: string;
-  /** Builds the per-message attachment policy. */
+  redeliver?: (entry: QueuedForward) => Promise<void>;
+  dropped?: DroppedForwardHandler;
   attachments?: () => AttachmentPolicy;
-  /** Answers `getState()` locally instead of reaching the consumer for every operation. */
   state?: StateAdapter;
   /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
   logForwardLevel?: LogLevel;
@@ -51,12 +62,9 @@ export interface RemoteChatOptions {
   maxQueuedForwards?: number;
 }
 
-/**
- * Caps concurrent tasks so a burst cannot open one request per message, and
- * caps the queue behind them so a history sync cannot park an unbounded number
- * of pending promises. Arrivals queue whenever anyone is already waiting, so a
- * latecomer cannot overtake the backlog.
- */
+/** Arrivals queue behind any backlog, so a latecomer cannot overtake it. */
+class ForwardBacklogError extends Error {}
+
 function createLimiter(limit: number, maxQueued: number) {
   const waiting: Array<() => void> = [];
   let active = 0;
@@ -64,7 +72,7 @@ function createLimiter(limit: number, maxQueued: number) {
   return async function run<T>(task: () => Promise<T>): Promise<T> {
     if (active >= limit || waiting.length > 0) {
       if (waiting.length >= maxQueued) {
-        throw new Error(
+        throw new ForwardBacklogError(
           `chat-adapter-remote: ${maxQueued} messages already waiting to be forwarded`,
         );
       }
@@ -82,7 +90,15 @@ function createLimiter(limit: number, maxQueued: number) {
 
 type EventPayload = Record<string, unknown>;
 
-/** Live objects the consumer rebuilds for itself, so they never cross the wire. */
+type StateStore = Record<string, (...args: unknown[]) => Promise<unknown>>;
+
+function isStateRefused(error: unknown): boolean {
+  return (
+    error instanceof RemoteAdapterRpcError &&
+    error.code === RpcErrorCode.STATE_UNAVAILABLE
+  );
+}
+
 const LOCAL_EVENT_KEYS = ["adapter", "thread", "channel"] as const;
 
 class RemoteChat {
@@ -90,6 +106,7 @@ class RemoteChat {
   private readonly rpc: RpcClient;
   private readonly warned = new Set<string>();
   private state?: StateAdapter;
+  private localState?: StateStore;
   private readonly limit: <T>(task: () => Promise<T>) => Promise<T>;
 
   constructor(private readonly options: RemoteChatOptions) {
@@ -107,8 +124,7 @@ class RemoteChat {
     });
   }
 
-  // Adapters call these unawaited from their event loops, so a rejection here
-  // would be unhandled and would take down the process holding the connection.
+  // Adapters call these unawaited, so a rejection would end the process.
 
   private async forward(
     method: string,
@@ -118,12 +134,43 @@ class RemoteChat {
     try {
       await this.limit(() => this.rpc.request(method, params));
     } catch (error) {
-      this.logger.error(`failed to deliver ${method} to consumer`, {
+      await this.undelivered(method, params, threadId, error);
+    }
+  }
+
+  /** A timed-out forward may have been handled, so it is never sent twice. */
+  private async undelivered(
+    method: string,
+    params: unknown[],
+    threadId: string | undefined,
+    error: unknown,
+  ): Promise<void> {
+    if (isUndelivered(error) && this.options.redeliver) {
+      this.logger.warn(`${method} did not reach the consumer, keeping it`, {
         threadId,
         error,
       });
-      this.options.onError?.(error, { phase: "forward", threadId });
+      const wire = (await encode(params)) as unknown[];
+      await this.options.redeliver(forwardEntry(method, wire, threadId));
+      return;
     }
+    this.logger.error(`failed to deliver ${method} to consumer`, {
+      threadId,
+      error,
+    });
+    this.options.onError?.(error, { phase: "forward", threadId });
+    if (isTransient(error) && !isUndelivered(error)) return;
+    const reason =
+      error instanceof ForwardBacklogError
+        ? "overflow"
+        : isUndelivered(error)
+          ? "expired"
+          : "rejected";
+    this.options.dropped?.(
+      forwardEntry(method, params, threadId),
+      reason,
+      error,
+    );
   }
 
   private async resolveMessage(value: unknown): Promise<Message | undefined> {
@@ -143,7 +190,7 @@ class RemoteChat {
       if (message) wire[key] = await serializeMessage(message, policy);
       else delete wire[key];
     }
-    // EmojiValue.toJSON() gives a placeholder, not the name the consumer needs.
+    // EmojiValue.toJSON() gives a placeholder, not the name.
     if (wire.emoji) wire.emoji = (wire.emoji as EmojiValue).name;
     return wire;
   }
@@ -164,11 +211,6 @@ class RemoteChat {
     }
   }
 
-  /**
-   * Unlike the fire-and-forget events, the platform is waiting on these, so
-   * the consumer's answer is returned. A failure resolves to undefined, which
-   * is what Chat treats as "no response" for both of them.
-   */
   private async askEvent(
     method: string,
     event: EventPayload,
@@ -178,10 +220,7 @@ class RemoteChat {
     try {
       const wire = await this.serializeEvent(event);
       const params = contextId === undefined ? [wire] : [wire, contextId];
-      // Deliberately outside the forward limiter: the platform times these out
-      // after a few seconds, and a burst of inbound messages would otherwise
-      // put a modal submit behind the whole backlog. They are paced by a human
-      // clicking, so they cannot flood anything on their own.
+      // Outside the forward limiter: the platform times these out in seconds, and a human paces them.
       return await this.rpc.request(method, params);
     } catch (error) {
       this.logger.error(`failed to deliver ${method} to consumer`, {
@@ -302,9 +341,21 @@ class RemoteChat {
   getState(): StateAdapter {
     this.state ??=
       this.options.state ??
-      createRemoteState((operation, args) =>
-        this.rpc.request("state", [operation, args]),
-      );
+      createRemoteState(async (operation, args) => {
+        // Refused means our own store, rather than handing the adapter nothing.
+        const local = this.localState;
+        if (local) return local[operation]!(...args);
+        try {
+          return await this.rpc.request("state", [operation, args]);
+        } catch (error) {
+          if (!isStateRefused(error)) throw error;
+          this.logger.warn(
+            "the consumer does not lend its state; falling back to a local store that is not persisted",
+          );
+          this.localState = createLocalState() as unknown as StateStore;
+          return this.localState[operation]!(...args);
+        }
+      });
     return this.state;
   }
 
@@ -331,11 +382,7 @@ class RemoteChat {
   }
 }
 
-/**
- * Members outside the bridged surface resolve to a logged no-op rather than
- * throwing. Adapters reach them from inside their own event callbacks, where
- * a throw becomes an unhandled rejection and kills the host process.
- */
+/** Unbridged members are a logged no-op: a throw inside an adapter's callback would end the process. */
 export function createRemoteChat(options: RemoteChatOptions): ChatInstance {
   const chat = new RemoteChat(options);
   return new Proxy(chat, {

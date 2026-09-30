@@ -20,9 +20,12 @@ import { ConsoleLogger } from "chat";
 
 import { decode, encode } from "../rpc/codec";
 import { verifyRequest, type DispatchOptions } from "../rpc/dispatch";
+import { createRpcClient, type RpcClient } from "../rpc/transport";
 import {
   RemoteAdapterRpcError,
   RpcErrorCode,
+  StreamDiscardedError,
+  isUndelivered,
   serializeError,
 } from "../rpc/errors";
 import {
@@ -37,7 +40,7 @@ import {
   type OptionalCapability,
 } from "../rpc/methods";
 import { createReplayGuard } from "../rpc/security";
-import type { FetchLike } from "../types";
+import type { FetchLike, HostEvent } from "../types";
 import type { LogLevel } from "./logger-bridge";
 import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
 import {
@@ -47,6 +50,19 @@ import {
   type InlineAttachments,
 } from "./attachments";
 import { resolveCustomMethods } from "./custom-methods";
+import {
+  Redelivery,
+  createMemoryForwardQueue,
+  type DroppedForwardHandler,
+  type ForwardQueue,
+  type ForwardRetryOptions,
+} from "./delivery";
+import {
+  createStreamer,
+  resolveStreamMode,
+  type StreamModeOptions,
+} from "./stream-modes";
+import { guardUnhandledRejections } from "./process-guard";
 import { StreamRegistry } from "./streams";
 
 export interface ServeAdapterOptions extends DispatchOptions {
@@ -55,7 +71,7 @@ export interface ServeAdapterOptions extends DispatchOptions {
   timeoutMs?: number;
   logger?: Logger;
   fetch?: FetchLike;
-  /** Receives failures from every phase, so they can be routed to alerting. */
+  /** Receives failures from every phase. */
   onError?: HostErrorHandler;
   /** Called once the wrapped adapter has initialized. */
   onReady?: () => void;
@@ -71,33 +87,26 @@ export interface ServeAdapterOptions extends DispatchOptions {
   streamTtlMs?: number;
   /** How long the adapter may take to start streaming. Default 10 seconds. */
   streamStartTimeoutMs?: number;
-  /**
-   * Whether attachment bytes travel inside the message. Default `"auto"`,
-   * which inlines them while the body budget allows and otherwise leaves them
-   * here for the consumer to fetch by id.
-   */
+  /** Inline attachment bytes. Default `"auto"`: inline while they fit. */
   inlineAttachments?: InlineAttachments;
   /** How long an attachment the consumer never fetched is kept. Default 5 minutes. */
   attachmentTtlMs?: number;
-  /**
-   * Adapter methods outside the `Adapter` interface that the consumer may
-   * call. `true` exposes the adapter's own public methods.
-   */
+  /** Methods outside the `Adapter` interface to expose; `true` for the adapter's own. */
   customMethods?: string[] | true;
-  /**
-   * Backs the `getState()` the wrapped adapter uses for its own persistence.
-   * Without one, every operation reaches the consumer's store instead.
-   */
+  /** Store for the adapter's own `getState()`. Default: the consumer's. */
   state?: StateAdapter;
-  /**
-   * Keeps a rejection thrown inside the adapter's own event loop from ending
-   * the process. Those surface nowhere else: they belong to no request, so
-   * nothing here can wrap them. Default true.
-   */
+  /** Keep rejections from the adapter's event loop from ending the process. Default true. */
   catchUnhandledRejections?: boolean;
+  /** Resend forwards the consumer never received. Default every minute for 24 hours; `false` disables. */
+  forwardRetry?: ForwardRetryOptions | false;
+  /** Where those forwards wait. Default in memory, capped at 1000. */
+  forwardQueue?: ForwardQueue;
+  /** Called for a forward that will not be delivered, with why. */
+  onDropped?: DroppedForwardHandler;
+  /** How replies stream; see `StreamModeOptions`. */
+  stream?: StreamModeOptions;
 }
 
-/** Both are deployment mistakes: failing here beats failing on the first request. */
 function requireOption(value: string | undefined, option: string): string {
   if (!value) {
     const variable = option === "secret" ? "SECRET" : "CONSUMER_URL";
@@ -123,7 +132,7 @@ function failure(
   return Response.json({ jsonrpc: "2.0", id, error: { code, message, data } });
 }
 
-/** Serves a real adapter over signed HTTP JSON-RPC, handing it a stand-in `ChatInstance` that forwards back to the consumer. */
+/** Serves a real adapter over signed HTTP JSON-RPC. */
 export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   /** Bound, so it can be handed straight to any Fetch-API router. */
   readonly fetch = (request: Request): Promise<Response> =>
@@ -134,8 +143,11 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private readonly dispatchOptions: DispatchOptions;
   private readonly capabilities: OptionalCapability[];
   private readonly customMethods: string[];
-  private onUnhandled?: (error: unknown) => void;
+  private unguard?: () => void;
+  private readonly redelivery?: Redelivery;
+  private readonly toConsumer: RpcClient;
   private readonly streams: StreamRegistry;
+  private readonly streamer?: ReturnType<typeof createStreamer>;
   private readonly attachments: AttachmentRegistry;
   private readonly scheduled = new Map<string, ScheduledMessage<TRawMessage>>();
   private starting?: Promise<void>;
@@ -161,8 +173,21 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       secret,
       replayGuard: options.replayGuard ?? createReplayGuard(),
     };
-    this.capabilities = OPTIONAL_CAPABILITIES.filter(
-      (name) => typeof adapter[name] === "function",
+    const streamMode = resolveStreamMode(adapter, options.stream?.mode);
+    this.streamer =
+      streamMode === "off"
+        ? undefined
+        : createStreamer(
+            adapter,
+            streamMode,
+            options.stream ?? {},
+            this.logger,
+          );
+    // `buffer` and `edit` give streaming to an adapter that has none.
+    this.capabilities = OPTIONAL_CAPABILITIES.filter((name) =>
+      name === "stream"
+        ? streamMode !== "off"
+        : typeof adapter[name] === "function",
     );
     this.customMethods = resolveCustomMethods(adapter, options.customMethods);
     this.streams = new StreamRegistry({
@@ -172,6 +197,33 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     this.attachments = new AttachmentRegistry(
       options.attachmentTtlMs ?? 300_000,
     );
+
+    const dropped: DroppedForwardHandler = (entry, reason, error) => {
+      this.logger.error(
+        `dropped ${entry.method} after ${entry.attempts} attempt(s): ${reason}`,
+        { threadId: entry.threadId, error },
+      );
+      options.onDropped?.(entry, reason, error);
+    };
+    this.toConsumer = createRpcClient({
+      url: consumerUrl,
+      secret,
+      timeoutMs: options.timeoutMs,
+      fetch: options.fetch,
+    });
+    if (options.forwardRetry !== false) {
+      this.redelivery = new Redelivery({
+        queue:
+          options.forwardQueue ??
+          createMemoryForwardQueue((entry) =>
+            dropped(entry, "overflow", undefined),
+          ),
+        ...options.forwardRetry,
+        send: (method, params) => this.toConsumer.request(method, params),
+        isUndelivered,
+        onDropped: dropped,
+      });
+    }
 
     this.chat = createRemoteChat({
       consumerUrl,
@@ -183,37 +235,39 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       userName: adapter.userName,
       attachments: () => this.attachmentPolicy(),
       state: options.state,
+      redeliver: this.redelivery
+        ? (entry) => this.redelivery!.keep(entry)
+        : undefined,
+      dropped,
       logForwardLevel: options.logForwardLevel,
       maxConcurrentForwards: options.maxConcurrentForwards,
       maxQueuedForwards: options.maxQueuedForwards,
     });
 
-    // `start()` and `ready` still surface the failure; this only keeps an
-    // unobserved rejection from killing the process before a request arrives.
+    // Surfaced by `start()`; this only keeps it from killing the process first.
     if (options.autoStart !== false) this.start().catch(() => {});
   }
 
-  /** Initializes the wrapped adapter. Idempotent, and rejects loudly on failure. */
+  /** Idempotent; rejects if the adapter fails to connect. */
   start(): Promise<void> {
     this.starting ??= this.initialize();
     return this.starting;
   }
 
   private guardProcess(): void {
-    if (this.options.catchUnhandledRejections === false || this.onUnhandled) {
+    if (this.options.catchUnhandledRejections === false || this.unguard) {
       return;
     }
-    this.onUnhandled = (error: unknown) => {
+    this.unguard = guardUnhandledRejections((error) => {
       this.logger.error("unhandled rejection inside the adapter", { error });
       this.options.onError?.(error, { phase: "adapter" });
-    };
-    process.on("unhandledRejection", this.onUnhandled);
+    });
   }
 
   private async initialize(): Promise<void> {
     this.guardProcess();
+    this.redelivery?.start();
     try {
-      // Handed to the host, so its lifecycle belongs to the host.
       await this.options.state?.connect();
       await this.adapter.initialize(this.chat);
       this.options.onReady?.();
@@ -223,13 +277,12 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
   }
 
-  /** Closes the adapter's connection and stops serving. Wire this to SIGTERM. */
+  /** Disconnects the adapter and stops serving. */
   async stop(): Promise<void> {
     this.stopped = true;
-    if (this.onUnhandled) {
-      process.off("unhandledRejection", this.onUnhandled);
-      this.onUnhandled = undefined;
-    }
+    this.redelivery?.stop();
+    this.unguard?.();
+    this.unguard = undefined;
     this.streams.clear();
     this.scheduled.clear();
     this.attachments.clear();
@@ -242,12 +295,17 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
   }
 
+  /** Reaches the consumer's `onEvent`. Best effort, never retried. */
+  emit(event: HostEvent): void {
+    this.toConsumer.notify("hostEvent", [event]);
+  }
+
   /** Resolves once the wrapped adapter's own initialize() has completed. */
   get ready(): Promise<void> {
     return this.start();
   }
 
-  /** For adapters driven by platform webhooks; waits for startup so an early delivery cannot reach a half-initialized adapter. */
+  /** Platform webhooks; waits for startup first. */
   async handleWebhook(
     request: Request,
     options?: WebhookOptions,
@@ -257,8 +315,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   }
 
   async handleRequest(request: Request): Promise<Response> {
-    // Nothing here may throw past this point: an unhandled rejection in a
-    // request handler would take down the process holding the connection.
+    // An unhandled rejection here would end the process holding the connection.
     try {
       return await this.route(request);
     } catch (error) {
@@ -302,16 +359,16 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       await this.start();
       return success(id, await encode(await this.dispatch(call.data)));
     } catch (error) {
-      // Logged in full here because the wire form is deliberately sanitised;
-      // without this an adapter failure leaves no trace on either side.
-      this.logger.error(`${call.data.method} failed`, { error });
-      this.options.onError?.(error, { phase: "dispatch" });
+      if (!(error instanceof StreamDiscardedError)) {
+        // The wire form is sanitised, so this is the only full record.
+        this.logger.error(`${call.data.method} failed`, { error });
+        this.options.onError?.(error, { phase: "dispatch" });
+      }
       const wire = serializeError(error);
       return failure(id, wire.code, wire.message, wire.data);
     }
   }
 
-  /** A fresh budget per message, since the limit is on one body. */
   private attachmentPolicy(): AttachmentPolicy {
     return {
       budget: new AttachmentBudget(
@@ -323,7 +380,6 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     };
   }
 
-  /** Bound accessor for an optional member the wrapped adapter may not have. */
   private required<K extends OptionalCapability>(
     name: K,
   ): NonNullable<Adapter<TThreadId, TRawMessage>[K]> {
@@ -482,14 +538,21 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
         return this.required("fetchSubject")(params[0] as TRawMessage);
       case "onThreadSubscribe":
         return this.required("onThreadSubscribe")(first);
-      case "streamStart":
-        return this.streams.open((chunks) =>
-          this.required("stream")(
-            first,
-            chunks,
-            (params[1] ?? undefined) as StreamOptions | undefined,
-          ),
+      case "streamStart": {
+        const streamer = this.streamer;
+        if (!streamer) {
+          throw new RemoteAdapterRpcError(
+            RpcErrorCode.METHOD_NOT_IMPLEMENTED,
+            "chat-adapter-remote: streaming is off on this host",
+          );
+        }
+        return this.streams.open((chunks, signal) =>
+          streamer(first, chunks, {
+            ...((params[1] ?? {}) as StreamOptions),
+            signal,
+          }),
         );
+      }
       case "streamPush":
         return this.streams.push(
           first,
@@ -548,7 +611,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
   }
 
-  /** The returned `cancel()` is a live closure, so the object stays here and is reached by id. Entries past their delivery time are dropped. */
+  /** `cancel()` is a closure, so the object stays here and is reached by id. */
   private async schedule(
     threadId: string,
     message: AdapterPostableMessage,
@@ -574,12 +637,10 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     };
   }
 
-  /** Live Message instances need the same treatment as inbound ones. */
   private async serializeFetchResult(
     result: FetchResult<TRawMessage>,
   ): Promise<unknown> {
-    // One budget for the whole response: it is one body, however many
-    // messages share it.
+    // One body, so one budget however many messages share it.
     const policy = this.attachmentPolicy();
     return {
       ...result,

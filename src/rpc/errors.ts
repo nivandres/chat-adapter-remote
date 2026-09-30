@@ -8,7 +8,6 @@ import {
   ValidationError,
 } from "@chat-adapter/shared";
 
-/** Codes follow JSON-RPC 2.0's reserved bands (-32768..-32000); adapter-domain errors use a small custom range below that. */
 export const RpcErrorCode = {
   PARSE_ERROR: -32700,
   INVALID_REQUEST: -32600,
@@ -21,6 +20,10 @@ export const RpcErrorCode = {
   REPLAYED: -32003,
   STREAM_NOT_FOUND: -32004,
   NOT_CANCELLABLE: -32005,
+  STATE_UNAVAILABLE: -32006,
+  UNAVAILABLE: -32007,
+  TIMEOUT: -32008,
+  STREAM_DISCARDED: -32009,
   ADAPTER_ERROR: -32010,
   ADAPTER_RATE_LIMITED: -32011,
   ADAPTER_AUTH_FAILED: -32012,
@@ -37,7 +40,6 @@ export interface RpcErrorObject {
   data?: unknown;
 }
 
-/** Transport/protocol-level failures (bad signature, unknown method, timeout). Not an `@chat-adapter/shared` class since these aren't adapter-domain errors. */
 export class RemoteAdapterRpcError extends Error {
   constructor(
     public readonly code: number,
@@ -49,7 +51,31 @@ export class RemoteAdapterRpcError extends Error {
   }
 }
 
-/** Maps a thrown error to a safe wire shape. Unrecognized errors collapse to a generic message; the original message/stack never leaves the host process. */
+/** Deliberately not posted: nothing should retry or repost it. */
+export class StreamDiscardedError extends RemoteAdapterRpcError {
+  constructor(message: string) {
+    super(RpcErrorCode.STREAM_DISCARDED, message);
+    this.name = "StreamDiscardedError";
+  }
+}
+
+/** Never handled, so safe to send again. A timeout may have been. */
+export function isUndelivered(error: unknown): boolean {
+  return (
+    error instanceof RemoteAdapterRpcError &&
+    error.code === RpcErrorCode.UNAVAILABLE
+  );
+}
+
+export function isTransient(error: unknown): boolean {
+  return (
+    error instanceof RemoteAdapterRpcError &&
+    (error.code === RpcErrorCode.UNAVAILABLE ||
+      error.code === RpcErrorCode.TIMEOUT)
+  );
+}
+
+/** Unrecognised errors collapse to a generic message, so host internals never leave. */
 export function serializeError(error: unknown): RpcErrorObject {
   if (error instanceof AdapterRateLimitError) {
     return {
@@ -118,7 +144,6 @@ export function serializeError(error: unknown): RpcErrorObject {
       },
     };
   }
-  // Raised by this package itself, so the message carries no host internals.
   if (error instanceof RemoteAdapterRpcError) {
     return { code: error.code, message: error.message, data: error.data };
   }
@@ -128,7 +153,6 @@ export function serializeError(error: unknown): RpcErrorObject {
   };
 }
 
-/** Reconstructs the real error class from a wire error object so Chat SDK's error-type-based handling keeps working across the process boundary. */
 export function deserializeError(error: RpcErrorObject): Error {
   const data = (error.data ?? {}) as Record<string, unknown>;
   const errorClass =
@@ -166,6 +190,9 @@ export function deserializeError(error: RpcErrorObject): Error {
         data.originalCode as string | undefined,
       );
     default:
+      if (error.code === RpcErrorCode.STREAM_DISCARDED) {
+        return new StreamDiscardedError(error.message);
+      }
       return new RemoteAdapterRpcError(error.code, error.message, error.data);
   }
 }

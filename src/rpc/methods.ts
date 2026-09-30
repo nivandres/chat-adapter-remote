@@ -1,13 +1,12 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 const ThreadId = z.string();
 const MessageId = z.string();
 const ChannelId = z.string();
 const Id = z.union([z.string(), z.number()]);
 
-/** Optional `Adapter` members the host reports and the consumer removes when unsupported. Synchronous members travel as per-message facts instead. */
 export const OPTIONAL_CAPABILITIES = [
   "disconnect",
   "reply",
@@ -33,8 +32,7 @@ export const OPTIONAL_CAPABILITIES = [
 
 export type OptionalCapability = (typeof OPTIONAL_CAPABILITIES)[number];
 
-// Payloads stay loose: they mirror `chat`-owned types that gain fields between
-// releases, and the method allowlist is the security boundary, not the shape.
+// Payloads stay loose: `chat` types gain fields between releases. The method allowlist is the boundary.
 
 const Loose = z.object({}).passthrough();
 const PostableSchema = z.union([z.string(), Loose]);
@@ -48,7 +46,6 @@ export const WireMessageSchema = z
   })
   .passthrough();
 
-/** Facts the host derives from the real adapter's synchronous members. */
 export const ThreadFactsSchema = z
   .object({
     channelId: z.string(),
@@ -71,7 +68,6 @@ export const HandshakeSchema = z
   })
   .passthrough();
 
-/** The `StateAdapter` surface, as an allowlist: the wire names an operation, never picks one. */
 export const STATE_OPERATIONS = [
   "acquireLock",
   "appendToList",
@@ -93,7 +89,16 @@ export const STATE_OPERATIONS = [
 
 export type StateOperation = (typeof STATE_OPERATIONS)[number];
 
-/** Consumer -> host, dispatched into the real adapter. */
+/** Keyed operations a prefix can confine; locks, queues and subscriptions are Chat's. */
+export const SCOPED_STATE_OPERATIONS = [
+  "get",
+  "set",
+  "setIfNotExists",
+  "delete",
+  "getList",
+  "appendToList",
+] as const satisfies readonly StateOperation[];
+
 export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
   z
     .object({
@@ -338,7 +343,6 @@ export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
 
 const ThreadEvent = z.object({ threadId: z.string() }).passthrough();
 
-/** Host -> consumer, dispatched into the real Chat instance. */
 export const INBOUND_CALLS = z.discriminatedUnion("method", [
   z
     .object({
@@ -396,7 +400,6 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
       params: z.tuple([ThreadId]),
     })
     .strict(),
-  // Answered rather than acknowledged: the platform waits for the reply.
   z
     .object({
       method: z.literal("processModalSubmit"),
@@ -435,6 +438,13 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
   ),
   z
     .object({
+      method: z.literal("hostEvent"),
+      id: z.undefined().optional(),
+      params: z.tuple([z.object({ type: z.string() }).passthrough()]),
+    })
+    .strict(),
+  z
+    .object({
       method: z.literal("log"),
       id: z.undefined().optional(),
       params: z.tuple([
@@ -447,5 +457,4 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
     .strict(),
 ]);
 
-/** Event payload keys that can carry a serialized `Message`. */
 export const EVENT_MESSAGE_KEYS = ["message", "previousMessage"] as const;

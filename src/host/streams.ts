@@ -1,6 +1,10 @@
 import type { RawMessage, StreamChunk } from "chat";
 
-import { RemoteAdapterRpcError, RpcErrorCode } from "../rpc/errors";
+import {
+  RemoteAdapterRpcError,
+  RpcErrorCode,
+  StreamDiscardedError,
+} from "../rpc/errors";
 
 type Chunk = string | StreamChunk;
 
@@ -47,16 +51,23 @@ function createQueue(onFirstPull: () => void): Queue {
 
 type StreamRun = (
   chunks: AsyncIterable<Chunk>,
+  signal: AbortSignal,
 ) => Promise<RawMessage<unknown> | null>;
 
-/** `done` means the adapter answered without reading anything, which is how it delegates back to Chat SDK's own fallback. */
+/** `done`: the adapter answered without reading, delegating to Chat's fallback. */
 export type StreamStart =
   { streamId: string } | { done: true; result: RawMessage<unknown> | null };
 
 interface PendingStream {
   queue: Queue;
+  controller: AbortController;
   result: Promise<RawMessage<unknown> | null>;
   expiresAt: number;
+}
+
+function release(stream: Pick<PendingStream, "queue" | "controller">): void {
+  stream.controller.abort();
+  stream.queue.close();
 }
 
 export interface StreamRegistryOptions {
@@ -66,7 +77,6 @@ export interface StreamRegistryOptions {
   startTimeoutMs?: number;
 }
 
-/** Rebuilds the AsyncIterable `Adapter.stream` expects from the consumer's open/push/end calls. */
 export class StreamRegistry {
   private readonly streams = new Map<string, PendingStream>();
   private readonly ttlMs: number;
@@ -84,12 +94,11 @@ export class StreamRegistry {
     let consuming!: () => void;
     const started = new Promise<void>((resolve) => (consuming = resolve));
     const queue = createQueue(consuming);
-    const result = run(queue.iterable);
-    // end() observes this; the no-op keeps a mid-stream failure from being unhandled meanwhile.
+    const controller = new AbortController();
+    const result = run(queue.iterable, controller.signal);
     result.catch(() => {});
 
-    // An adapter that neither answers nor starts reading would otherwise hold
-    // the request open with no id, leaving nothing for sweep() to reclaim.
+    // Otherwise a stalled adapter holds the request open with no id to reclaim.
     let expire: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<"timeout">((resolve) => {
       expire = setTimeout(() => resolve("timeout"), this.startTimeoutMs);
@@ -106,9 +115,8 @@ export class StreamRegistry {
     clearTimeout(expire);
 
     if (settled === "timeout") {
-      // Not awaited: an adapter that hung here may never settle, which is the
-      // very case being handled. The catch above keeps it from going unhandled.
-      queue.close();
+      // Not awaited: a hung adapter may never settle.
+      release({ queue, controller });
       throw new RemoteAdapterRpcError(
         RpcErrorCode.STREAM_NOT_FOUND,
         `chat-adapter-remote: the adapter did not start streaming within ${this.startTimeoutMs}ms`,
@@ -122,6 +130,7 @@ export class StreamRegistry {
     const streamId = `s${++this.sequence}`;
     this.streams.set(streamId, {
       queue,
+      controller,
       result,
       expiresAt: Date.now() + this.ttlMs,
     });
@@ -141,25 +150,34 @@ export class StreamRegistry {
   ): Promise<RawMessage<unknown> | null> {
     const stream = this.require(streamId);
     this.streams.delete(streamId);
+    if (aborted) stream.controller.abort();
     stream.queue.close();
-    if (!aborted) return stream.result;
-    await stream.result.catch(() => undefined);
-    return null;
+
+    let result: RawMessage<unknown> | null;
+    try {
+      result = await stream.result;
+    } catch (error) {
+      if (!aborted) throw error;
+      throw new StreamDiscardedError(
+        "chat-adapter-remote: the reply was cut off",
+      );
+    }
+    // The chunks are spent: null would send Chat to a fallback that posts a blank.
+    if (!result) {
+      throw new StreamDiscardedError(
+        "chat-adapter-remote: the stream ended without a message",
+      );
+    }
+    return result;
   }
 
-  /** Closes every open stream, releasing whatever the adapter holds for them. */
   clear(): void {
-    for (const stream of this.streams.values()) stream.queue.close();
+    for (const stream of this.streams.values()) release(stream);
     this.streams.clear();
     this.unwatch();
   }
 
-  /**
-   * Armed only while streams are open, and unref'd so it never holds the
-   * process alive. Without it a stream abandoned mid-flight — a consumer that
-   * lost its connection — would keep the adapter blocked on an iterable that
-   * never ends, until some later stream happened to trigger a sweep.
-   */
+  /** Unref'd, and only while streams are open. */
   private watch(): void {
     if (this.sweeper) return;
     this.sweeper = setInterval(() => this.sweep(), this.ttlMs);
@@ -173,7 +191,6 @@ export class StreamRegistry {
   }
 
   private require(streamId: string): PendingStream {
-    // Expiry is enforced on use, so nothing runs in the background.
     this.sweep();
     const stream = this.streams.get(streamId);
     if (!stream) {
@@ -190,7 +207,7 @@ export class StreamRegistry {
     for (const [streamId, stream] of this.streams) {
       if (stream.expiresAt > now) continue;
       this.streams.delete(streamId);
-      stream.queue.close();
+      release(stream);
     }
     if (this.streams.size === 0) this.unwatch();
   }

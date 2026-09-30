@@ -15,7 +15,7 @@ export function sign(
   );
 }
 
-/** `crypto.timingSafeEqual` throws on a length mismatch instead of returning `false`; the length check keeps a malformed signature a clean 401 instead of an uncaught 500. */
+/** `timingSafeEqual` throws on unequal lengths. */
 export function verify(
   rawBody: string,
   timestamp: string,
