@@ -52,7 +52,7 @@ export async function POST(request: Request) {
 }
 ```
 
-Mount `chat.webhooks.remote` — not `remote.handleWebhook` — as the `consumerUrl` route; that is what triggers Chat's lazy adapter initialization. Register the adapter under the same key as its `name`.
+Mount `chat.webhooks.remote` — not `remote.handleWebhook` — as the `consumerUrl` route; that is what triggers Chat's lazy adapter initialization. Register it under the key you pass as `name`; thread ids are translated to it, whatever the host's adapter is called.
 
 Pass `waitUntil` on serverless. Events are acknowledged as soon as they are accepted, so without it the runtime can freeze the handler mid-turn and the reply is never sent.
 
@@ -72,7 +72,11 @@ await host.start(); // rejects if the adapter fails to connect
 process.on("SIGTERM", () => host.stop());
 ```
 
-`start()` is idempotent; `ready` is shorthand for it. `stop()` disconnects the adapter, drops open streams, and refuses further dispatch. `onError` covers the `initialize`, `forward`, `dispatch`, and `shutdown` phases.
+`start()` is idempotent; `ready` is shorthand for it. `stop()` disconnects the adapter, drops open streams, and refuses further dispatch. `onError` covers the `initialize`, `forward`, `dispatch`, `shutdown` and `adapter` phases.
+
+`host.emit({ type: "qr", code })` reaches the consumer's `onEvent`, for showing a pairing QR or connection state in your own UI.
+
+`serveAdapters({ [name]: { adapter, secret, consumerUrl } })` runs several adapters in one process, each reached at `/<path>/<name>` with its own secret; one that fails to connect leaves the others running.
 
 ## What crosses the bridge
 
@@ -80,11 +84,11 @@ process.on("SIGTERM", () => host.stop());
 
 **Inbound** is every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modals, options load, agent-session, assistant and app-home events, and turn cancellation. `getState`, `history` and `transcripts` are not bridged and resolve to a logged no-op.
 
-Adapters that persist their own data call `chat.getState()`. That reaches the consumer's store by default, so both halves share it; pass `state` to the host to give it one of its own instead.
+Adapters that persist their own data call `chat.getState()`. That reaches the consumer's store, limited by the consumer's `hostState`: `"scoped"` (default) lends keyed values and lists under a prefix of its own, `"full"` the whole store, `"off"` nothing. Pass `state` to the host to give it a store of its own instead.
 
 The host reports which optional members its adapter actually implements, and the consumer removes the rest, so Chat's own fallbacks still apply to anything the real adapter never had.
 
-`isDM`, `channelIdFromThreadId` and `getChannelVisibility` are answered from facts the host sends with each message. A thread the consumer has not seen yet falls back to the SDK defaults.
+`isDM`, `channelIdFromThreadId` and `getChannelVisibility` are answered from facts the host sends with each message, kept in the consumer's store so another instance can load them. A thread no instance has seen falls back to the SDK defaults.
 
 Methods outside the `Adapter` interface are not exposed unless the host says so. List them with `customMethods`, or pass `true` for the adapter's own public methods, and they arrive on the consumer over the same signed protocol:
 
@@ -97,11 +101,15 @@ await remote.setPresence(jid, "composing");
 
 ## Streaming
 
-Adapters with native streaming get it. When the host's adapter declines to stream, Chat's own post-and-edit fallback takes over as usual.
+Adapters with native streaming get it. One without gets `buffer`: the reply is gathered behind a typing indicator and posted once, and nothing is posted if it comes out empty. Set the host's `stream.mode` to `"edit"` to post and edit instead, or `"off"` to leave it to Chat. An edited reply that gets cut off keeps what it already showed.
+
+In `buffer`, a reply cut off before it finishes is discarded by default; `stream.publishOnAbort` can keep it (`"partial"`, or `{ minChars }`). A reply deliberately not posted rejects with `StreamDiscardedError`, so it is not mistaken for a failure.
 
 ## Delivery
 
-At-most-once: a failed forward is logged and dropped, and an acknowledgement means "received", not "handled".
+A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default; pass a `forwardQueue` to keep it somewhere shared. An acknowledgement means "received", not "handled". A backlog arrives together, and Chat's default `concurrency` drops messages for a thread that is busy; `"queue"` keeps them.
+
+A consumer that starts while the host is down recovers on its own: each call tries again, rather than failing for good.
 
 Chat serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers — set a `queue` concurrency strategy on the consumer's `Chat` if you need every message. This matters here because a host draining a backlog after a reconnect sends exactly that shape of burst.
 
@@ -117,7 +125,7 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 
 ## Limits
 
-One adapter per host: multiple tenants means one host per tenant, with several named `RemoteAdapter`s on one `Chat`. No shared-process registry, no delivery guarantee, and no batching of forwarded logs. Signing uses `node:crypto` and the codec uses `Buffer`, so neither side runs on edge runtimes without a Node compatibility layer.
+No batching of forwarded logs. Signing uses `node:crypto` and the codec uses `Buffer`, so neither side runs on edge runtimes without a Node compatibility layer.
 
 ## License
 

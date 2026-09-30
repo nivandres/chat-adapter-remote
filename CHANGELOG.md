@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0
+
+Hardening from a live WhatsApp deployment: the bridge now survives either side being down, streams well on platforms without native streaming, and serves several adapters from one process. Both sides must be upgraded together.
+
+### Fixed
+
+- A consumer that started while the host was down stayed broken until restarted. Chat keeps the promise from its first `initialize()` and never clears it, so a rejection there is permanent — and since Chat starts adapters with `Promise.all`, one broken adapter broke them all. `initialize()` no longer rejects for an unreachable host, and every call tries the handshake again. A wrong secret or protocol still fails loudly.
+- A forward that failed because the consumer was down was lost. It is now sent again until it arrives; see `forwardRetry`.
+- A reply that came out empty, or was cut off, was posted as a blank message. Answering `null` after the stream was consumed sent Chat to its own fallback, which read an empty iterable and posted `" "`. Such a reply now rejects with `StreamDiscardedError`. The host does not report it as a failure.
+- The adapter's `stream` could not tell a cut-off turn from a finished one: the consumer's abort signal never reached it. The host now gives it a signal of its own and aborts it.
+- `isDM` and the other thread facts lived only in memory, so a second instance or a restarted one treated every DM as a group. They are now kept in the consumer's store and loaded on `initialize()`.
+- Each host added its own `unhandledRejection` listener, so more than ten in one process tripped Node's `MaxListenersExceededWarning`. They now share one.
+- A network failure surfaced as a bare `TypeError`. It is now a `RemoteAdapterRpcError`, with `UNAVAILABLE` for a call that never arrived and `TIMEOUT` for one that may have.
+
+### Added
+
+- Stream modes on the host: `native` when the adapter has streaming, otherwise `buffer` — gathered behind a typing indicator and posted once. Also `edit`, which keeps what it posted when cut off, and `off`. In `buffer`, `publishOnAbort` decides what happens to a cut-off reply, `"discard"` by default.
+- `forwardRetry`, `forwardQueue` and `onDropped`: a forward that never reached the consumer is sent again every minute for 24 hours by default, with interval, backoff, cap, retention and attempts all configurable, from a queue that can live somewhere shared. A timed-out forward is never sent again, since it may have been handled.
+- `hostState` on the consumer: how much of its store the host may use. `"scoped"` by default, which allows keyed values and lists under a prefix of the adapter's own; `"full"`; or `"off"`, where the host falls back to a store of its own that does not persist.
+- Thread ids are translated between the host adapter's name and the key the consumer is registered under, so the consumer can use any key.
+- `serveAdapters()`, several adapters in one process, each with its own secret and consumer, reached at `/<path>/<name>`. One that cannot connect leaves the others running.
+- `host.emit()` and the consumer's `onEvent`, for reporting a pairing QR or connection state.
+
+### Changed
+
+- The host's access to the consumer's store is scoped by default. Adapters that used locks, queues or subscriptions through `getState()` need `hostState: "full"`.
+- `PROTOCOL_VERSION` is 4.
+
 ## 0.5.0
 
 Two defects found running 0.4.0 against a real WhatsApp account, both of which ended the host process.
@@ -137,6 +165,7 @@ A correctness pass against real adapter objects, plus an expansion of the bridge
 
 Initial release.
 
+[0.6.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nivandres/chat-adapter-remote/compare/v0.2.1...v0.3.0

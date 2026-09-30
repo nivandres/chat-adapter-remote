@@ -1,6 +1,6 @@
 {
   "name": "chat-adapter-remote",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Run any Chat SDK adapter in a separate process or deployment from your bot logic, bridged over signed HTTP JSON-RPC",
   "author": "nivandres",
   "license": "MIT",
