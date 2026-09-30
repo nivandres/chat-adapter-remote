@@ -243,17 +243,64 @@ describe("streaming", () => {
       request: (method: string, params: unknown) => Promise<unknown>;
     };
     const original = rpc.request.bind(rpc);
-    let ended: boolean | undefined;
+    let ended: string | undefined;
     rpc.request = async (method, params) => {
       if (method === "streamPush") throw new Error("network died");
-      if (method === "streamEnd") ended = (params as [string, boolean])[1];
+      if (method === "streamEnd") ended = (params as [string, string])[1];
       return original(method, params);
     };
 
     await expect(
       b.remote.stream!(THREAD, source(["a", "b"]).iterable),
     ).rejects.toThrow(/network died/);
-    expect(ended).toBe(true);
+    expect(ended).toBe("failed");
+  });
+
+  it("fails the adapter's read when the source fails, as it would in-process", async () => {
+    let seen: unknown;
+    const b = streamingBridge(async (_threadId, chunks) => {
+      try {
+        for await (const _chunk of chunks) void _chunk;
+      } catch (error) {
+        seen = error;
+        throw error;
+      }
+      return { id: "never", threadId: THREAD, raw: {} };
+    });
+    await handshake(b);
+    const failing = {
+      async *[Symbol.asyncIterator]() {
+        yield "a";
+        throw new Error("model crashed");
+      },
+    };
+
+    await expect(b.remote.stream!(THREAD, failing)).rejects.toThrow(
+      /model crashed/,
+    );
+    expect(seen).toBeInstanceOf(Error);
+  });
+
+  it("returns what the adapter kept after a source failure", async () => {
+    const b = streamingBridge(async (_threadId, chunks) => {
+      try {
+        for await (const _chunk of chunks) void _chunk;
+      } catch {
+        return { id: "kept", threadId: THREAD, raw: {} };
+      }
+      return null;
+    });
+    await handshake(b);
+    const failing = {
+      async *[Symbol.asyncIterator]() {
+        yield "a";
+        throw new Error("model crashed");
+      },
+    };
+
+    await expect(b.remote.stream!(THREAD, failing)).resolves.toMatchObject({
+      id: "kept",
+    });
   });
 
   it("reclaims a stream abandoned mid-flight without another stream call", async () => {

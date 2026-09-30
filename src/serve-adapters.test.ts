@@ -167,7 +167,13 @@ describe("host events", () => {
         method: "POST",
         body,
         headers: {
-          "x-chat-adapter-remote-signature": sign(body, timestamp, SECRET),
+          "x-chat-adapter-remote-signature": sign(
+            body,
+            timestamp,
+            "nonce",
+            SECRET,
+          ),
+          "x-chat-adapter-remote-nonce": "nonce",
           "x-chat-adapter-remote-timestamp": timestamp,
         },
       }),

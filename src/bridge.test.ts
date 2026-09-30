@@ -282,11 +282,7 @@ describe("handshake", () => {
     await handshake(b);
 
     for (const name of OPTIONAL_CAPABILITIES) {
-      // `stream` is always announced: without a native one the host buffers.
-      const implemented =
-        name === "reply" ||
-        name === "stream" ||
-        typeof plain[name] === "function";
+      const implemented = name === "reply" || typeof plain[name] === "function";
       expect({ name, bridged: typeof b.remote[name] === "function" }).toEqual({
         name,
         bridged: implemented,
@@ -462,7 +458,13 @@ describe("misconfiguration", () => {
         method: "POST",
         body,
         headers: {
-          "x-chat-adapter-remote-signature": sign(body, timestamp, SECRET),
+          "x-chat-adapter-remote-signature": sign(
+            body,
+            timestamp,
+            "nonce",
+            SECRET,
+          ),
+          "x-chat-adapter-remote-nonce": "nonce",
           "x-chat-adapter-remote-timestamp": timestamp,
         },
       }),
@@ -485,7 +487,13 @@ describe("request verification", () => {
       method: "POST",
       body,
       headers: {
-        "x-chat-adapter-remote-signature": sign(body, timestamp, secret),
+        "x-chat-adapter-remote-signature": sign(
+          body,
+          timestamp,
+          "nonce",
+          secret,
+        ),
+        "x-chat-adapter-remote-nonce": "nonce",
         "x-chat-adapter-remote-timestamp": timestamp,
       },
     });
@@ -531,7 +539,8 @@ describe("request verification", () => {
     const body = call("postMessage", [THREAD, "hi"]);
     const timestamp = String(Date.now());
     const headers = {
-      "x-chat-adapter-remote-signature": sign(body, timestamp, SECRET),
+      "x-chat-adapter-remote-signature": sign(body, timestamp, "nonce", SECRET),
+      "x-chat-adapter-remote-nonce": "nonce",
       "x-chat-adapter-remote-timestamp": timestamp,
     };
     const replay = () =>
@@ -594,7 +603,13 @@ describe("request verification", () => {
         method: "POST",
         body,
         headers: {
-          "x-chat-adapter-remote-signature": sign(body, timestamp, SECRET),
+          "x-chat-adapter-remote-signature": sign(
+            body,
+            timestamp,
+            "nonce",
+            SECRET,
+          ),
+          "x-chat-adapter-remote-nonce": "nonce",
           "x-chat-adapter-remote-timestamp": timestamp,
         },
       }),

@@ -39,12 +39,15 @@ describe("signing", () => {
   const timestamp = String(Date.now());
 
   it("verifies a body it signed and rejects anything else", () => {
-    const signature = sign("payload", timestamp, "secret");
+    const signature = sign("payload", timestamp, "n1", "secret");
 
-    expect(verify("payload", timestamp, signature, "secret")).toBe(true);
-    expect(verify("tampered", timestamp, signature, "secret")).toBe(false);
-    expect(verify("payload", timestamp, signature, "other")).toBe(false);
-    expect(verify("payload", timestamp, "short", "secret")).toBe(false);
+    expect(verify("payload", timestamp, "n1", signature, "secret")).toBe(true);
+    expect(verify("tampered", timestamp, "n1", signature, "secret")).toBe(
+      false,
+    );
+    expect(verify("payload", timestamp, "n2", signature, "secret")).toBe(false);
+    expect(verify("payload", timestamp, "n1", signature, "other")).toBe(false);
+    expect(verify("payload", timestamp, "n1", "short", "secret")).toBe(false);
   });
 
   it("accepts timestamps inside the window only", () => {

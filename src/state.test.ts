@@ -122,13 +122,12 @@ describe("adapter state", () => {
     await handshake(b);
 
     // What Baileys does: an async handler outside any request of ours.
-    const escaped = Promise.reject(new Error("poll update blew up"));
+    void Promise.reject(new Error("poll update blew up"));
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     expect(onError).toHaveBeenCalledWith(expect.any(Error), {
       phase: "adapter",
     });
-    await escaped.catch(() => undefined);
   });
 
   it("guards the process with one listener however many hosts run", async () => {
@@ -210,6 +209,50 @@ describe("thread facts across instances", () => {
     expect(remoteB.channelIdFromThreadId("mock:D1:1")).toBe(
       remoteA.channelIdFromThreadId("mock:D1:1"),
     );
+  });
+
+  it("lists a thread once however many instances meet it", async () => {
+    const shared = createMemoryState();
+    let hostChat!: ChatInstance;
+    const adapter = createMockAdapter("mock", {
+      initialize: vi.fn(
+        async (instance: ChatInstance) => void (hostChat = instance),
+      ),
+    });
+    let target!: Chat;
+    const host = serveAdapter(adapter, {
+      secret: SECRET,
+      consumerUrl: CONSUMER_URL,
+      fetch: async (input, init) =>
+        target.webhooks.mock!(new Request(input, init), {}),
+    });
+    const instance = async () => {
+      const chat = new Chat({
+        userName: "bot",
+        adapters: {
+          mock: createRemoteAdapter({
+            url: HOST_URL,
+            secret: SECRET,
+            name: "mock",
+            fetch: (input, init) =>
+              host.handleRequest(new Request(input, init)),
+          }),
+        },
+        state: shared,
+      });
+      await chat.initialize();
+      return chat;
+    };
+    const [first, second] = [await instance(), await instance()];
+    await host.ready;
+
+    for (const chat of [first, second]) {
+      target = chat;
+      await hostChat.processMessage(adapter, "mock:C1:1", message("hi"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(await shared.getList("remote:mock:threads")).toEqual(["mock:C1:1"]);
   });
 
   it("falls back to the default for a thread no instance has seen", async () => {

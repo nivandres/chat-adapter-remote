@@ -33,8 +33,8 @@ async function streamingWith(
 }
 
 describe("buffer mode", () => {
-  it("is what an adapter without native streaming gets, and posts one message", async () => {
-    const b = await streamingWith();
+  it("gathers the reply and posts one message", async () => {
+    const b = await streamingWith({ mode: "buffer" });
     const { iterable } = reply(["Hel", "lo ", "there"]);
 
     await b.remote.stream!(THREAD, iterable);
@@ -47,7 +47,7 @@ describe("buffer mode", () => {
   });
 
   it("keeps the typing indicator up while it gathers the reply", async () => {
-    const b = await streamingWith();
+    const b = await streamingWith({ mode: "buffer" });
 
     await b.remote.stream!(THREAD, reply(["a"]).iterable);
 
@@ -55,7 +55,7 @@ describe("buffer mode", () => {
   });
 
   it("posts nothing for an empty reply, and says so with a typed error", async () => {
-    const b = await streamingWith();
+    const b = await streamingWith({ mode: "buffer" });
 
     await expect(
       b.remote.stream!(THREAD, reply(["", "  "]).iterable),
@@ -65,7 +65,7 @@ describe("buffer mode", () => {
 
   it("does not report a discarded reply as a failure", async () => {
     const onError = vi.fn();
-    const b = bridge({}, { onError });
+    const b = bridge({}, { onError, stream: { mode: "buffer" } });
     await handshake(b);
 
     await expect(
@@ -74,18 +74,36 @@ describe("buffer mode", () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
-  it("discards a cut-off reply by default", async () => {
-    const b = await streamingWith();
-    const { iterable, signal } = reply(["half a sen", "tence"], 1);
+  it("ends the typing indicator it started, which Chat never knew of", async () => {
+    const endTyping = vi.fn(async () => {});
+    const b = await streamingWith({ mode: "buffer" }, { endTyping });
 
     await expect(
-      b.remote.stream!(THREAD, iterable, { signal }),
+      b.remote.stream!(THREAD, reply([]).iterable),
     ).rejects.toBeInstanceOf(StreamDiscardedError);
-    expect(b.adapter.postMessage).not.toHaveBeenCalled();
+    expect(endTyping).toHaveBeenCalledWith(THREAD);
   });
 
-  it("posts what arrived before the cut when asked to", async () => {
-    const b = await streamingWith({ publishOnAbort: "partial" });
+  it("never posts a reply whose source failed, as a gathering adapter would not", async () => {
+    const onError = vi.fn();
+    const b = bridge({}, { onError, stream: { mode: "buffer" } });
+    await handshake(b);
+    const failing = {
+      async *[Symbol.asyncIterator]() {
+        yield "half";
+        throw new Error("model crashed");
+      },
+    };
+
+    await expect(b.remote.stream!(THREAD, failing)).rejects.toThrow(
+      /model crashed/,
+    );
+    expect(b.adapter.postMessage).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("posts what arrived before the cut by default, as gathering adapters do", async () => {
+    const b = await streamingWith({ mode: "buffer" });
     const { iterable, signal } = reply(["kept", " dropped"], 1);
 
     await b.remote.stream!(THREAD, iterable, { signal });
@@ -95,14 +113,33 @@ describe("buffer mode", () => {
     });
   });
 
+  it("discards a cut-off reply when asked to", async () => {
+    const b = await streamingWith({
+      mode: "buffer",
+      publishOnAbort: "discard",
+    });
+    const { iterable, signal } = reply(["half a sen", "tence"], 1);
+
+    await expect(
+      b.remote.stream!(THREAD, iterable, { signal }),
+    ).rejects.toBeInstanceOf(StreamDiscardedError);
+    expect(b.adapter.postMessage).not.toHaveBeenCalled();
+  });
+
   it("posts a cut-off reply only once it is long enough", async () => {
-    const short = await streamingWith({ publishOnAbort: { minChars: 20 } });
+    const short = await streamingWith({
+      mode: "buffer",
+      publishOnAbort: { minChars: 20 },
+    });
     const cut = reply(["too short", " more"], 1);
     await expect(
       short.remote.stream!(THREAD, cut.iterable, { signal: cut.signal }),
     ).rejects.toBeInstanceOf(StreamDiscardedError);
 
-    const long = await streamingWith({ publishOnAbort: { minChars: 5 } });
+    const long = await streamingWith({
+      mode: "buffer",
+      publishOnAbort: { minChars: 5 },
+    });
     const kept = reply(["long enough", " more"], 1);
     await long.remote.stream!(THREAD, kept.iterable, { signal: kept.signal });
     expect(long.adapter.postMessage).toHaveBeenCalledWith(THREAD, {
@@ -193,6 +230,12 @@ describe("edit mode", () => {
 });
 
 describe("off and native", () => {
+  it("leaves an adapter without native streaming to Chat by default", async () => {
+    const b = await streamingWith();
+
+    expect(b.remote.stream).toBeUndefined();
+  });
+
   it("announces no streaming when off, so Chat uses its own", async () => {
     const b = await streamingWith({ mode: "off" });
 
