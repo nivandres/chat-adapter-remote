@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0
+
+Streaming now defaults to what Chat does with any other adapter, and a cut or failed reply reaches the host's adapter the way it would in-process. Both sides must be upgraded together.
+
+### Fixed
+
+- A reply whose source failed reached the host's adapter as a normal end, so an adapter that gathers the reply posted the partial text. The failure now reaches the adapter's read, as in-process, and what the adapter keeps, if anything, is returned.
+- Two instances making the same call in the same millisecond signed identical requests, so the host rejected the second as a replay. Two consumers starting together could fail `initialize()`. Every request now carries a signed nonce.
+- `buffer` and `edit` left the typing indicator on when they posted nothing. They now end it, since Chat never knew it was started.
+- Every restart listed each thread it met again, so the recent-threads list filled with duplicates. A thread is now listed once, when it first reaches the store.
+- The thread facts were preloaded one read at a time, which took seconds on a store over HTTP. They are now read in parallel.
+
+### Changed
+
+- `stream.mode` defaults to `native` when the adapter streams and `off` otherwise, leaving Chat's post-and-edit as with any other adapter. `buffer` and `edit` are opt-in.
+- `publishOnAbort` defaults to `"partial"`, as the adapters that gather a reply do.
+- `streamEnd` reports how the stream ended — `finished`, `aborted` or `failed` — and requests carry a nonce header. `PROTOCOL_VERSION` is 5.
+
 ## 0.6.0
 
 Hardening from a live WhatsApp deployment: the bridge now survives either side being down, streams well on platforms without native streaming, and serves several adapters from one process. Both sides must be upgraded together.

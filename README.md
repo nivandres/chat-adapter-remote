@@ -101,13 +101,13 @@ await remote.setPresence(jid, "composing");
 
 ## Streaming
 
-Adapters with native streaming get it. One without gets `buffer`: the reply is gathered behind a typing indicator and posted once, and nothing is posted if it comes out empty. Set the host's `stream.mode` to `"edit"` to post and edit instead, or `"off"` to leave it to Chat. An edited reply that gets cut off keeps what it already showed.
+Streaming behaves as it would in-process: the adapter's own streaming when it has one, otherwise Chat's post-and-edit. A turn that is cut off ends the stream with its `signal` aborted, and a source that fails fails the adapter's read.
 
-In `buffer`, a reply cut off before it finishes is discarded by default; `stream.publishOnAbort` can keep it (`"partial"`, or `{ minChars }`). A reply deliberately not posted rejects with `StreamDiscardedError`, so it is not mistaken for a failure.
+The host's `stream.mode` can stream for an adapter that has none. `"buffer"` gathers the reply behind a typing indicator and posts it once; `stream.publishOnAbort` decides what a cut-off reply does (`"partial"` by default, `"discard"`, or `{ minChars }`). `"edit"` posts and then edits, and keeps what it showed if cut off. Neither posts an empty reply: it rejects with `StreamDiscardedError`, so it is not mistaken for a failure.
 
 ## Delivery
 
-A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default; pass a `forwardQueue` to keep it somewhere shared. An acknowledgement means "received", not "handled". A backlog arrives together, and Chat's default `concurrency` drops messages for a thread that is busy; `"queue"` keeps them.
+A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default; pass a `forwardQueue` to keep it somewhere shared. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
 
 A consumer that starts while the host is down recovers on its own: each call tries again, rather than failing for good.
 
@@ -117,7 +117,7 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 
 ## Security
 
-- Every request in both directions is HMAC-SHA256 signed over the raw body and compared in constant time.
+- Every request in both directions is HMAC-SHA256 signed over a timestamp, a nonce and the raw body, and compared in constant time.
 - Signatures are single-use inside a tolerance window. The default replay store is per-process; pass a `replayGuard` — `seen()` may be async — to share one across instances.
 - `maxBodyBytes` bounds how much is read from a request or a response. It is unlimited by default, since both ends are yours; set it if either endpoint is reachable from somewhere you do not control.
 - Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
