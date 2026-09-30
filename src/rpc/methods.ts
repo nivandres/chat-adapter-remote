@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 const ThreadId = z.string();
 const MessageId = z.string();
@@ -98,6 +98,11 @@ export const SCOPED_STATE_OPERATIONS = [
   "getList",
   "appendToList",
 ] as const satisfies readonly StateOperation[];
+
+/** How the consumer's side of a stream ended: `failed` reaches the adapter as an error, as it would in-process. */
+export const STREAM_ENDINGS = ["finished", "aborted", "failed"] as const;
+
+export type StreamEnding = (typeof STREAM_ENDINGS)[number];
 
 export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
   z
@@ -301,7 +306,7 @@ export const OUTBOUND_CALLS = z.discriminatedUnion("method", [
     .object({
       method: z.literal("streamEnd"),
       id: Id,
-      params: z.tuple([z.string(), z.boolean().nullish()]),
+      params: z.tuple([z.string(), z.enum(STREAM_ENDINGS).nullish()]),
     })
     .strict(),
   z

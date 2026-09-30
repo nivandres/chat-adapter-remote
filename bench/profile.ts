@@ -65,12 +65,14 @@ async function main() {
     params: [THREAD, "hello"],
   });
   const timestamp = String(Date.now());
-  const signature = sign(body, timestamp, SECRET);
+  const signature = sign(body, timestamp, "nonce", SECRET);
   const parsed = JSON.parse(body);
 
   console.log("\nper-stage cost (single-threaded, in-process)");
-  bench("sign", 20000, () => sign(body, timestamp, SECRET));
-  bench("verify", 20000, () => verify(body, timestamp, signature, SECRET));
+  bench("sign", 20000, () => sign(body, timestamp, "nonce", SECRET));
+  bench("verify", 20000, () =>
+    verify(body, timestamp, "nonce", signature, SECRET),
+  );
   bench("zod allowlist parse", 20000, () =>
     OUTBOUND_CALLS.safeParse({
       method: parsed.method,

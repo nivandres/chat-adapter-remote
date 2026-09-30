@@ -2,6 +2,7 @@ import { JsonRpcRequestSchema } from "./envelope";
 import { RpcErrorCode, type RpcErrorObject } from "./errors";
 import type { ReplayGuard } from "./security";
 import {
+  NONCE_HEADER,
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
   isTimestampFresh,
@@ -84,10 +85,12 @@ export async function verifyRequest(
 
   const signature = request.headers.get(SIGNATURE_HEADER);
   const timestamp = request.headers.get(TIMESTAMP_HEADER);
+  const nonce = request.headers.get(NONCE_HEADER);
   if (
     !signature ||
     !timestamp ||
-    !verify(rawBody, timestamp, signature, options.secret)
+    !nonce ||
+    !verify(rawBody, timestamp, nonce, signature, options.secret)
   ) {
     return {
       ok: false,

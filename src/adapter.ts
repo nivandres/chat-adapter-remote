@@ -259,7 +259,7 @@ export class RemoteAdapter<
       this.threads.delete(this.threads.keys().next().value!);
     this.threads.set(threadId, facts);
     if (!known || JSON.stringify(known) !== JSON.stringify(facts)) {
-      void this.persistThread(threadId, facts, !known);
+      void this.persistThread(threadId, facts);
     }
   }
 
@@ -267,16 +267,18 @@ export class RemoteAdapter<
   private async persistThread(
     threadId: string,
     facts: ThreadFacts,
-    isNew: boolean,
   ): Promise<void> {
     try {
       const state = this.chat?.getState();
       if (!state) return;
-      await state.set(this.threadKey(threadId), facts, THREAD_FACTS_TTL_MS);
-      if (isNew) {
+      const key = this.threadKey(threadId);
+      // Only a thread new to the store joins the list, however often instances restart.
+      if (await state.setIfNotExists(key, facts, THREAD_FACTS_TTL_MS)) {
         await state.appendToList(this.recentThreadsKey, threadId, {
           maxLength: this.maxCachedThreads,
         });
+      } else {
+        await state.set(key, facts, THREAD_FACTS_TTL_MS);
       }
     } catch (error) {
       this.logger.debug("could not persist thread facts", { threadId, error });
@@ -287,12 +289,20 @@ export class RemoteAdapter<
     try {
       const state = this.chat?.getState();
       if (!state) return;
-      const recent = await state.getList<string>(this.recentThreadsKey);
-      for (const threadId of recent.slice(-this.maxCachedThreads)) {
-        if (this.threads.has(threadId)) continue;
-        const facts = await state.get<ThreadFacts>(this.threadKey(threadId));
-        if (facts) this.threads.set(threadId, facts);
-      }
+      const recent = [
+        ...new Set(await state.getList<string>(this.recentThreadsKey)),
+      ]
+        .slice(-this.maxCachedThreads)
+        .filter((threadId) => !this.threads.has(threadId));
+      // In parallel: a store over HTTP would otherwise take a round trip per thread.
+      const facts = await Promise.all(
+        recent.map((threadId) =>
+          state.get<ThreadFacts>(this.threadKey(threadId)),
+        ),
+      );
+      recent.forEach((threadId, index) => {
+        if (facts[index]) this.threads.set(threadId, facts[index]);
+      });
     } catch (error) {
       this.logger.warn("could not preload thread facts", { error });
     }
@@ -650,15 +660,17 @@ export class RemoteAdapter<
       if (batch.length > 0)
         await this.rpc.request("streamPush", [streamId, batch]);
     } catch (error) {
-      await this.rpc
-        .request("streamEnd", [streamId, true])
-        .catch(() => undefined);
+      // As in-process: the adapter sees the failure, and keeps a reply only if it chooses to.
+      const kept = await this.rpc
+        .request("streamEnd", [streamId, "failed"])
+        .catch(() => null);
+      if (kept) return kept as RawMessage<TRawMessage>;
       throw error;
     }
 
     return (await this.rpc.request("streamEnd", [
       streamId,
-      signal?.aborted ?? false,
+      signal?.aborted ? "aborted" : "finished",
     ])) as RawMessage<TRawMessage> | null;
   }
 

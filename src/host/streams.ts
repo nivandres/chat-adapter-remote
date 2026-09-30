@@ -1,5 +1,6 @@
 import type { RawMessage, StreamChunk } from "chat";
 
+import type { StreamEnding } from "../rpc/methods";
 import {
   RemoteAdapterRpcError,
   RpcErrorCode,
@@ -10,7 +11,7 @@ type Chunk = string | StreamChunk;
 
 interface Queue {
   push(chunk: Chunk): void;
-  close(): void;
+  close(failure?: Error): void;
   iterable: AsyncIterable<Chunk>;
 }
 
@@ -18,6 +19,7 @@ function createQueue(onFirstPull: () => void): Queue {
   const pending: Chunk[] = [];
   let wake: (() => void) | undefined;
   let closed = false;
+  let failure: Error | undefined;
 
   const notify = () => {
     wake?.();
@@ -29,8 +31,9 @@ function createQueue(onFirstPull: () => void): Queue {
       pending.push(chunk);
       notify();
     },
-    close() {
+    close(error) {
       closed = true;
+      failure = error;
       notify();
     },
     iterable: {
@@ -41,6 +44,7 @@ function createQueue(onFirstPull: () => void): Queue {
             yield pending.shift()!;
             continue;
           }
+          if (failure) throw failure;
           if (closed) return;
           await new Promise<void>((resolve) => (wake = resolve));
         }
@@ -146,20 +150,25 @@ export class StreamRegistry {
 
   async end(
     streamId: string,
-    aborted?: boolean,
+    ending: StreamEnding = "finished",
   ): Promise<RawMessage<unknown> | null> {
     const stream = this.require(streamId);
     this.streams.delete(streamId);
-    if (aborted) stream.controller.abort();
-    stream.queue.close();
+    if (ending === "aborted") stream.controller.abort();
+    stream.queue.close(
+      ending === "failed"
+        ? new Error("chat-adapter-remote: the reply stream failed")
+        : undefined,
+    );
 
     let result: RawMessage<unknown> | null;
     try {
       result = await stream.result;
     } catch (error) {
-      if (!aborted) throw error;
+      if (ending === "finished") throw error;
+      // The turn ended on the consumer's side; the adapter only followed it.
       throw new StreamDiscardedError(
-        "chat-adapter-remote: the reply was cut off",
+        `chat-adapter-remote: the reply was ${ending === "aborted" ? "cut off" : "stopped by its failed source"}`,
       );
     }
     // The chunks are spent: null would send Chat to a fallback that posts a blank.

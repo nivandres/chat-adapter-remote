@@ -38,6 +38,7 @@ import {
   OUTBOUND_CALLS,
   PROTOCOL_VERSION,
   type OptionalCapability,
+  type StreamEnding,
 } from "../rpc/methods";
 import { createReplayGuard } from "../rpc/security";
 import type { FetchLike, HostEvent } from "../types";
@@ -561,7 +562,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       case "streamEnd":
         return this.streams.end(
           first,
-          (params[1] ?? undefined) as boolean | undefined,
+          (params[1] ?? undefined) as StreamEnding | undefined,
         );
       case "scheduleMessage":
         return this.schedule(

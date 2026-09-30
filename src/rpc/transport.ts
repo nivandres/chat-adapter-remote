@@ -6,7 +6,12 @@ import {
   RpcErrorCode,
   deserializeError,
 } from "./errors";
-import { SIGNATURE_HEADER, TIMESTAMP_HEADER, sign } from "./signing";
+import {
+  NONCE_HEADER,
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  sign,
+} from "./signing";
 import type { FetchLike } from "../types";
 
 export interface RpcClientOptions {
@@ -41,6 +46,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       params: await encode(params),
     });
     const timestamp = String(Date.now());
+    const nonce = crypto.randomUUID();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -48,8 +54,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          [SIGNATURE_HEADER]: sign(body, timestamp, options.secret),
+          [SIGNATURE_HEADER]: sign(body, timestamp, nonce, options.secret),
           [TIMESTAMP_HEADER]: timestamp,
+          [NONCE_HEADER]: nonce,
         },
         body,
         signal: controller.signal,

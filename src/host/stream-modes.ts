@@ -14,9 +14,9 @@ export type StreamMode = "native" | "buffer" | "edit" | "off";
 export type PublishOnAbort = "partial" | "discard" | { minChars: number };
 
 export interface StreamModeOptions {
-  /** Default `native` when the adapter streams, otherwise `buffer`. */
+  /** Default `native` when the adapter streams, otherwise `off`, as with any other adapter. */
   mode?: StreamMode;
-  /** `buffer` only: what to do with a cut-off reply. Default `"discard"`. */
+  /** `buffer` only: what to do with a cut-off reply. Default `"partial"`, as the adapters that gather do. */
   publishOnAbort?: PublishOnAbort;
   /** Typing renewal. Default 4s, under the shortest platform timeout. */
   typingIntervalMs?: number;
@@ -42,20 +42,23 @@ function keepsPartial(policy: PublishOnAbort, text: string): boolean {
   return text.trim().length >= policy.minChars;
 }
 
+/** The returned stop also ends the indicator, which Chat cannot: it never started it. */
 function keepTyping(
   adapter: Adapter,
   threadId: string,
   intervalMs: number,
   logger: Logger,
-): () => void {
-  const renew = () =>
-    adapter.startTyping(threadId).catch((error: unknown) => {
-      logger.debug("typing indicator failed", { threadId, error });
-    });
+): () => Promise<void> {
+  const failed = (error: unknown) =>
+    logger.debug("typing indicator failed", { threadId, error });
+  const renew = () => adapter.startTyping(threadId).catch(failed);
   void renew();
   const timer = setInterval(() => void renew(), intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  return async () => {
+    clearInterval(timer);
+    await adapter.endTyping?.(threadId).catch(failed);
+  };
 }
 
 export function resolveStreamMode(
@@ -63,7 +66,7 @@ export function resolveStreamMode(
   requested?: StreamMode,
 ): StreamMode {
   const native = typeof adapter.stream === "function";
-  const mode = requested ?? (native ? "native" : "buffer");
+  const mode = requested ?? (native ? "native" : "off");
   return mode === "native" && !native ? "off" : mode;
 }
 
@@ -74,7 +77,7 @@ export function createStreamer(
   options: StreamModeOptions,
   logger: Logger,
 ): Streamer {
-  const policy = options.publishOnAbort ?? "discard";
+  const policy = options.publishOnAbort ?? "partial";
   const typingIntervalMs = options.typingIntervalMs ?? 4_000;
   const editIntervalMs = options.editIntervalMs ?? 1_500;
 
@@ -95,7 +98,7 @@ export function createStreamer(
       try {
         for await (const chunk of chunks) text += textOf(chunk);
       } finally {
-        stopTyping();
+        await stopTyping();
       }
       if (streamOptions.signal?.aborted && !keepsPartial(policy, text)) {
         throw new StreamDiscardedError(
@@ -139,7 +142,7 @@ export function createStreamer(
         }
       }
     } finally {
-      stopTyping();
+      await stopTyping();
     }
 
     // What was posted and edited stays; a cut only stops further edits.
