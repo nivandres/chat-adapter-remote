@@ -164,7 +164,7 @@ async function hostWith(
   const redelivery = Reflect.get(host, "redelivery") as {
     drain(): Promise<void>;
   };
-  return { adapter, chat: () => chat, received, onDropped, redelivery };
+  return { adapter, host, chat: () => chat, received, onDropped, redelivery };
 }
 
 describe("redelivery", () => {
@@ -341,6 +341,33 @@ describe("redelivery", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reports what only this process held once it stops", async () => {
+    const mode = { value: "down" as "up" | "down" | "slow" | "refuse" };
+    const h = await hostWith(mode, { forwardRetry: { intervalMs: 60_000 } });
+    await h.chat().processMessage(h.adapter, THREAD, message("stranded"));
+
+    await h.host.stop();
+
+    expect(h.onDropped).toHaveBeenCalledWith(
+      expect.objectContaining({ method: "processMessage" }),
+      "stopped",
+      undefined,
+    );
+  });
+
+  it("leaves a shared queue alone on stop, for the next host to retry", async () => {
+    const takeDue = vi.fn(async () => []);
+    const mode = { value: "down" as "up" | "down" | "slow" | "refuse" };
+    const h = await hostWith(mode, {
+      forwardQueue: { push: async () => {}, takeDue },
+    });
+
+    await h.host.stop();
+
+    expect(takeDue).not.toHaveBeenCalled();
+    expect(h.onDropped).not.toHaveBeenCalled();
   });
 
   it("keeps entries in a queue of your own", async () => {

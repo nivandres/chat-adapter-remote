@@ -61,6 +61,29 @@ describe("adding and removing adapters at runtime", () => {
     expect(adapters[2]!.disconnect).not.toHaveBeenCalled();
   });
 
+  it("holds a request that arrives mid-reload and serves it with the new adapter", async () => {
+    const hosts = serveAdapters({});
+    await hosts.add("ch", entry(createMockAdapter("whatsapp")));
+    let finish!: () => void;
+    const next = createMockAdapter("whatsapp", {
+      initialize: vi.fn(
+        () => new Promise<void>((resolve) => (finish = resolve)),
+      ),
+    });
+
+    const reloading = hosts.add("ch", entry(next));
+    const sent = post(hosts, "ch", "during reload");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    finish();
+    await reloading;
+
+    await expect(sent).resolves.toBeDefined();
+    expect(next.postMessage).toHaveBeenCalledWith(
+      "whatsapp:x",
+      "during reload",
+    );
+  });
+
   it("does not keep an adapter that fails to start", async () => {
     const hosts = serveAdapters({});
     const broken = createMockAdapter("whatsapp", {
@@ -161,5 +184,76 @@ describe("tenants", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(onError).toHaveBeenCalledWith(expect.any(Error));
+  });
+});
+
+describe("a consumer facing a host that changes", () => {
+  function counted(hosts: AdapterHosts) {
+    const handshakes = { count: 0 };
+    const remote = createRemoteAdapter({
+      url: "https://host.test/rpc/ch",
+      secret: SECRET,
+      fetch: (input, init) => {
+        if (String(init?.body).includes("__handshake")) handshakes.count++;
+        return hosts.fetch(new Request(input, init));
+      },
+    });
+    return { remote, handshakes };
+  }
+
+  it("handshakes again once the host is reloaded with another setup", async () => {
+    const hosts = serveAdapters({});
+    await hosts.add("ch", {
+      ...entry(createMockAdapter("whatsapp")),
+      stream: { mode: "off" },
+    });
+    const { remote, handshakes } = counted(hosts);
+    await remote.postMessage("remote:x", "before");
+    expect(remote.stream).toBeUndefined();
+
+    await hosts.add("ch", {
+      ...entry(createMockAdapter("whatsapp")),
+      stream: { mode: "buffer" },
+    });
+    await remote.postMessage("remote:x", "noticed");
+    await remote.postMessage("remote:x", "after");
+
+    expect(handshakes.count).toBe(2);
+    expect(remote.stream).toBeTypeOf("function");
+  });
+
+  it("does not handshake again across a restart with the same setup, or replicas alike", async () => {
+    const hosts = serveAdapters({});
+    await hosts.add("ch", entry(createMockAdapter("whatsapp")));
+    const { remote, handshakes } = counted(hosts);
+    await remote.postMessage("remote:x", "one");
+
+    await hosts.add("ch", entry(createMockAdapter("whatsapp")));
+    await remote.postMessage("remote:x", "two");
+    await remote.postMessage("remote:x", "three");
+
+    expect(handshakes.count).toBe(1);
+  });
+});
+
+describe("rotating the secret", () => {
+  it("accepts every listed secret and signs with the first", async () => {
+    const hosts = serveAdapters({});
+    const adapter = createMockAdapter("whatsapp");
+    await hosts.add("ch", { ...entry(adapter), secret: ["new", "old"] });
+    const consumer = (secret: string | string[]) =>
+      createRemoteAdapter({
+        url: "https://host.test/rpc/ch",
+        secret,
+        fetch: (input, init) => hosts.fetch(new Request(input, init)),
+      });
+
+    await consumer("old").postMessage("remote:x", "still on the old one");
+    await consumer(["new", "old"]).postMessage("remote:x", "already rotated");
+    await expect(
+      consumer("other").postMessage("remote:x", "never valid"),
+    ).rejects.toMatchObject({ code: -32000 });
+
+    expect(adapter.postMessage).toHaveBeenCalledTimes(2);
   });
 });
