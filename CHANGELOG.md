@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+
+- `serveTenants({ list, load })`, one adapter per tenant record: the ids `list()` returns are served on start, each built by `load(id)`, and `tenants.load(id)` replaces or removes one when its record changes. Unknown routes never trigger a lookup.
+- `add(name, entry)`, `remove(name)` and `get(name)` on the hosts `serveAdapters` returns, to change them at runtime. Changes to one name run one at a time, so a replaced adapter is always stopped.
+
 ## 0.7.0
 
 Streaming now defaults to what Chat does with any other adapter, and a cut or failed reply reaches the host's adapter the way it would in-process. Both sides must be upgraded together.

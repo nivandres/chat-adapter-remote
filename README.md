@@ -76,7 +76,9 @@ process.on("SIGTERM", () => host.stop());
 
 `host.emit({ type: "qr", code })` reaches the consumer's `onEvent`, for showing a pairing QR or connection state in your own UI.
 
-`serveAdapters({ [name]: { adapter, secret, consumerUrl } })` runs several adapters in one process, each reached at `/<path>/<name>` with its own secret; one that fails to connect leaves the others running.
+`serveAdapters({ [name]: { adapter, secret, consumerUrl } })` runs several adapters in one process, each reached at `/<path>/<name>` with its own secret; one that fails to connect leaves the others running. `hosts.add(name, entry)` and `hosts.remove(name)` change them at runtime.
+
+For one adapter per tenant record, `serveTenants({ list, load })` serves the ids `list()` returns, each built by `load(id)` from your record — credentials, secret and `consumerUrl` included. Call `tenants.load(id)` when a record changes: it replaces the running adapter, or removes it when `load` returns nothing. A route nobody added answers 404 and never triggers a lookup.
 
 ## What crosses the bridge
 
