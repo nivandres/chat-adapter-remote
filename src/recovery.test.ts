@@ -267,6 +267,82 @@ describe("redelivery", () => {
     expect(kept!.nextAttemptAt).toBe(3000);
   });
 
+  it("drops one the consumer refuses once back, and still delivers the rest", async () => {
+    const { Redelivery, createMemoryForwardQueue, forwardEntry } =
+      await import("./host/delivery");
+    const delivered: string[] = [];
+    const onDropped = vi.fn();
+    const redelivery = new Redelivery({
+      queue: createMemoryForwardQueue(() => {}),
+      intervalMs: 0,
+      send: async (_method, params) => {
+        const [text] = params as [string];
+        if (text === "refused") throw new Error("invalid params");
+        delivered.push(text);
+      },
+      isUndelivered: () => false,
+      onDropped,
+    });
+    await redelivery.keep(forwardEntry("processMessage", ["refused"], THREAD));
+    await redelivery.keep(forwardEntry("processMessage", ["kept"], THREAD));
+
+    await redelivery.drain();
+
+    expect(onDropped).toHaveBeenCalledWith(
+      expect.objectContaining({ params: ["refused"] }),
+      "rejected",
+      expect.any(Error),
+    );
+    expect(delivered).toEqual(["kept"]);
+  });
+
+  it("drops the oldest entry once the memory queue is full", async () => {
+    const { createMemoryForwardQueue, forwardEntry } =
+      await import("./host/delivery");
+    const overflowed: unknown[] = [];
+    const queue = createMemoryForwardQueue(
+      (entry) => void overflowed.push(entry.threadId),
+      2,
+    );
+
+    for (const threadId of ["first", "second", "third"]) {
+      await queue.push(forwardEntry("processMessage", [], threadId));
+    }
+
+    expect(overflowed).toEqual(["first"]);
+    expect(
+      (await queue.takeDue(Number.POSITIVE_INFINITY)).map((e) => e.threadId),
+    ).toEqual(["second", "third"]);
+  });
+
+  it("retries on its own timer until stopped", async () => {
+    vi.useFakeTimers();
+    try {
+      const { Redelivery, createMemoryForwardQueue, forwardEntry } =
+        await import("./host/delivery");
+      const send = vi.fn(async () => undefined);
+      const redelivery = new Redelivery({
+        queue: createMemoryForwardQueue(() => {}),
+        intervalMs: 1000,
+        send,
+        isUndelivered: () => true,
+        onDropped: () => {},
+      });
+      await redelivery.keep(forwardEntry("processMessage", [], THREAD));
+
+      redelivery.start();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(send).toHaveBeenCalledOnce();
+
+      redelivery.stop();
+      await redelivery.keep(forwardEntry("processMessage", [], THREAD));
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(send).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps entries in a queue of your own", async () => {
     const mode = { value: "down" as "up" | "down" | "slow" | "refuse" };
     const pushed: unknown[] = [];

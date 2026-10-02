@@ -62,6 +62,25 @@ describe("signing", () => {
     expect(await guard.seen("sig", 30_000)).toBe(false);
     expect(await guard.seen("sig", 30_000)).toBe(true);
   });
+
+  it("forgets signatures past their window, and stays bounded under a flood", async () => {
+    vi.useFakeTimers();
+    try {
+      const guard = createReplayGuard({ maxEntries: 2 });
+      await guard.seen("old", 1000);
+      vi.advanceTimersByTime(1001);
+      // Past the window the timestamp check refuses it anyway; the guard need not remember it.
+      expect(await guard.seen("old", 1000)).toBe(false);
+
+      await guard.seen("a", 1000);
+      await guard.seen("b", 1000);
+      await guard.seen("c", 1000);
+      expect(await guard.seen("a", 1000)).toBe(false);
+      expect(await guard.seen("c", 1000)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("codec", () => {

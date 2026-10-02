@@ -469,6 +469,34 @@ describe("events that carry an answer back", () => {
 
     expect(await joined.promise).toBe("u9");
   });
+
+  it.each([
+    "processModalClose",
+    "processAppHomeOpened",
+    "processAppContextChanged",
+    "processAssistantThreadStarted",
+    "processAssistantContextChanged",
+    "processAgentSessionStopped",
+    "processAgentSessionTitleChanged",
+  ] as const)("delivers %s to Chat", async (method) => {
+    const b = bridge();
+    await handshake(b);
+    const delivered = deferred<unknown>();
+    vi.spyOn(b.chat, method).mockImplementation(
+      ((event: unknown) => void delivered.resolve(event)) as never,
+    );
+
+    (b.hostChat()[method] as (event: unknown) => void)({
+      adapter: b.adapter,
+      threadId: THREAD,
+      userId: "u1",
+    });
+
+    expect(await delivered.promise).toMatchObject({
+      threadId: THREAD,
+      userId: "u1",
+    });
+  });
 });
 
 describe("methods that keep a live object on the host", () => {

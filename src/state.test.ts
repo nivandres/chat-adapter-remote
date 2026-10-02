@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createRemoteAdapter } from "./adapter";
 import { serveAdapter } from "./host";
+import { createLocalState } from "./host/state";
 import {
   CONSUMER_URL,
   HOST_URL,
@@ -141,6 +142,47 @@ describe("adapter state", () => {
     await Promise.all(bridges.map((b) => b.host.stop()));
 
     expect(process.listenerCount("unhandledRejection")).toBe(before);
+  });
+});
+
+describe("local state", () => {
+  it("keeps values, honours setIfNotExists and forgets on delete", async () => {
+    const state = createLocalState();
+
+    expect(await state.get("k")).toBeNull();
+    expect(await state.setIfNotExists("k", 1)).toBe(true);
+    expect(await state.setIfNotExists("k", 2)).toBe(false);
+    expect(await state.get("k")).toBe(1);
+    await state.set("k", 3);
+    expect(await state.get("k")).toBe(3);
+    await state.delete("k");
+    expect(await state.get("k")).toBeNull();
+  });
+
+  it("expires values after their TTL", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = createLocalState();
+      await state.set("k", "v", 1000);
+
+      vi.advanceTimersByTime(999);
+      expect(await state.get("k")).toBe("v");
+      vi.advanceTimersByTime(1);
+      expect(await state.get("k")).toBeNull();
+      expect(await state.setIfNotExists("k", "again")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("appends to lists in order", async () => {
+    const state = createLocalState();
+
+    expect(await state.getList("l")).toEqual([]);
+    await state.appendToList("l", "a");
+    await state.appendToList("l", "b");
+
+    expect(await state.getList("l")).toEqual(["a", "b"]);
   });
 });
 
