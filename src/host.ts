@@ -10,6 +10,11 @@ export {
   type HostedAdapter,
 } from "./host/serve-adapters";
 export {
+  AdapterTenants,
+  serveTenants,
+  type TenantSource,
+} from "./host/serve-tenants";
+export {
   type HostErrorContext,
   type HostErrorHandler,
   type HostErrorPhase,
