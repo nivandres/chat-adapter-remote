@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.1
+
+Changing things at runtime — reloading a tenant, restarting or reconfiguring a host, rotating the secret — no longer breaks calls in flight or leaves the consumer on stale facts. Compatible with 0.8.0 on either side.
+
+### Fixed
+
+- A request reaching a tenant mid-reload found nothing and failed with a 404. It now waits for the reload and reaches the new adapter.
+- The consumer kept its first handshake for good, so a host reloaded with another adapter, name, stream mode or set of methods was used with stale capabilities and thread-id translation. The host now sends a digest of its handshake with every exchange, and the consumer handshakes again when it changes. Replicas set up alike share it, so they do not cause handshakes.
+- Forwards waiting in the in-memory queue vanished when the host stopped or was reloaded. They are now reported to `onDropped` as `"stopped"`; a `forwardQueue` of your own is left for the next host.
+
+### Added
+
+- `secret` takes a list while rotating: the first entry signs and any of them verifies, on both sides.
+
 ## 0.8.0
 
 ### Added

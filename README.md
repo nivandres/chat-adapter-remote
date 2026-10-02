@@ -78,7 +78,7 @@ process.on("SIGTERM", () => host.stop());
 
 `serveAdapters({ [name]: { adapter, secret, consumerUrl } })` runs several adapters in one process, each reached at `/<path>/<name>` with its own secret; one that fails to connect leaves the others running. `hosts.add(name, entry)` and `hosts.remove(name)` change them at runtime.
 
-For one adapter per tenant record, `serveTenants({ list, load })` serves the ids `list()` returns, each built by `load(id)` from your record — credentials, secret and `consumerUrl` included. Call `tenants.load(id)` when a record changes: it replaces the running adapter, or removes it when `load` returns nothing. A route nobody added answers 404 and never triggers a lookup.
+For one adapter per tenant record, `serveTenants({ list, load })` serves the ids `list()` returns, each built by `load(id)` from your record — credentials, secret and `consumerUrl` included. Call `tenants.load(id)` when a record changes: it replaces the running adapter, or removes it when `load` returns nothing, and requests arriving meanwhile wait for it. A route nobody added answers 404 and never triggers a lookup.
 
 ## What crosses the bridge
 
@@ -109,9 +109,9 @@ The host's `stream.mode` can stream for an adapter that has none. `"buffer"` gat
 
 ## Delivery
 
-A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default; pass a `forwardQueue` to keep it somewhere shared. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
+A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default, and what it still holds when the host stops is reported as `"stopped"`; pass a `forwardQueue` to keep it somewhere shared, across restarts and reloads. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
 
-A consumer that starts while the host is down recovers on its own: each call tries again, rather than failing for good.
+A consumer that starts while the host is down recovers on its own: each call tries again, rather than failing for good. When the host comes back with a different setup — another adapter, name, stream mode or set of methods — the consumer handshakes again on its next call; a restart with the same setup costs nothing.
 
 Chat serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers — set a `queue` concurrency strategy on the consumer's `Chat` if you need every message. This matters here because a host draining a backlog after a reconnect sends exactly that shape of burst.
 
@@ -123,7 +123,7 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 - Signatures are single-use inside a tolerance window. The default replay store is per-process; pass a `replayGuard` — `seen()` may be async — to share one across instances.
 - `maxBodyBytes` bounds how much is read from a request or a response. It is unlimited by default, since both ends are yours; set it if either endpoint is reachable from somewhere you do not control.
 - Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
-- One shared secret covers both directions, with no key id or rotation path. A leaked secret grants full send-as-the-bot access.
+- One shared secret covers both directions, and a leaked one grants full send-as-the-bot access. To rotate it, give both sides `[old, new]`, then `[new, old]`, then `new`: the first entry signs and any of them verifies.
 
 ## Limits
 
