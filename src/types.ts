@@ -1,6 +1,7 @@
 import type { Logger } from "chat";
 
 import type { ReplayGuard } from "./rpc/security";
+import type { Secret } from "./rpc/signing";
 
 /** Narrower than `typeof fetch`, so any function can be injected. */
 export type FetchLike = (
@@ -28,8 +29,8 @@ export type RemoteAdapterErrorHandler = (
 export interface RemoteAdapterConfig {
   /** The host's dispatch endpoint. */
   url: string;
-  /** Shared HMAC secret, identical on both sides. */
-  secret: string;
+  /** Shared HMAC secret, identical on both sides. While rotating, a list: the first signs, any verifies. */
+  secret: Secret;
   /** The key it is registered under; thread ids are translated to it. Default "remote". */
   name?: string;
   /** Overrides the bot username learned from the handshake. */

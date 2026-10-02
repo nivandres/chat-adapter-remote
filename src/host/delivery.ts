@@ -15,7 +15,8 @@ export interface ForwardQueue {
   takeDue(now: number): Promise<QueuedForward[]>;
 }
 
-export type DropReason = "expired" | "rejected" | "overflow";
+/** `stopped`: held in memory by a host that stopped, so nothing else will retry it. */
+export type DropReason = "expired" | "rejected" | "overflow" | "stopped";
 
 let sequence = 0;
 

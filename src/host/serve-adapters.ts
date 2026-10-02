@@ -34,11 +34,10 @@ export class AdapterHosts {
   private readonly entries = new Map<string, AdapterHost>();
   private readonly pending = new Map<string, Promise<unknown>>();
 
-  readonly fetch = (request: Request): Promise<Response> => {
-    const host = this.get(nameOf(request));
-    return host
-      ? host.handleRequest(request)
-      : Promise.resolve(notFound(nameOf(request)));
+  readonly fetch = async (request: Request): Promise<Response> => {
+    const name = nameOf(request);
+    const host = await this.settled(name);
+    return host ? host.handleRequest(request) : notFound(name);
   };
 
   constructor(entries: Record<string, HostedAdapter> = {}) {
@@ -88,15 +87,19 @@ export class AdapterHosts {
     );
   }
 
-  handleWebhook(
+  async handleWebhook(
     name: string,
     request: Request,
     options?: WebhookOptions,
   ): Promise<Response> {
-    const host = this.get(name);
-    return host
-      ? host.handleWebhook(request, options)
-      : Promise.resolve(notFound(name));
+    const host = await this.settled(name);
+    return host ? host.handleWebhook(request, options) : notFound(name);
+  }
+
+  /** A request arriving mid-reload waits for it, rather than finding nothing there. */
+  private async settled(name: string): Promise<AdapterHost | undefined> {
+    await this.pending.get(name)?.catch(() => undefined);
+    return this.get(name);
   }
 
   private async stopHost(name: string): Promise<void> {

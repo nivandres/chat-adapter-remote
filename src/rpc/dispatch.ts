@@ -5,12 +5,14 @@ import {
   NONCE_HEADER,
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
+  secretsOf,
+  type Secret,
   isTimestampFresh,
   verify,
 } from "./signing";
 
 export interface DispatchOptions {
-  secret: string;
+  secret: Secret;
   /** Rejects requests whose signed timestamp is older than this. Default 30s. */
   timestampToleranceMs?: number;
   /** Rejects bodies larger than this. Unlimited by default: both ends are trusted. */
@@ -90,7 +92,9 @@ export async function verifyRequest(
     !signature ||
     !timestamp ||
     !nonce ||
-    !verify(rawBody, timestamp, nonce, signature, options.secret)
+    !secretsOf(options.secret).some((secret) =>
+      verify(rawBody, timestamp, nonce, signature, secret),
+    )
   ) {
     return {
       ok: false,

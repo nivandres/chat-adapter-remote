@@ -10,13 +10,17 @@ import {
   NONCE_HEADER,
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
+  secretsOf,
   sign,
+  type Secret,
 } from "./signing";
 import type { FetchLike } from "../types";
 
 export interface RpcClientOptions {
   url: string;
-  secret: string;
+  secret: Secret;
+  /** Read for every request. */
+  headers?: () => Record<string, string>;
   timeoutMs?: number;
   maxBodyBytes?: number;
   fetch?: FetchLike;
@@ -54,7 +58,13 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          [SIGNATURE_HEADER]: sign(body, timestamp, nonce, options.secret),
+          ...options.headers?.(),
+          [SIGNATURE_HEADER]: sign(
+            body,
+            timestamp,
+            nonce,
+            secretsOf(options.secret)[0]!,
+          ),
           [TIMESTAMP_HEADER]: timestamp,
           [NONCE_HEADER]: nonce,
         },

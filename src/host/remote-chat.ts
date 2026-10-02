@@ -18,6 +18,7 @@ import {
 } from "../rpc/errors";
 import { serializeMessage, type AttachmentPolicy } from "../rpc/message-wire";
 import { EVENT_MESSAGE_KEYS } from "../rpc/methods";
+import type { Secret } from "../rpc/signing";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
 import { createBridgingLogger, type LogLevel } from "./logger-bridge";
 import {
@@ -43,7 +44,8 @@ export type HostErrorHandler = (
 
 export interface RemoteChatOptions {
   consumerUrl: string;
-  secret: string;
+  secret: Secret;
+  headers?: () => Record<string, string>;
   timeoutMs?: number;
   logger?: Logger;
   fetch?: FetchLike;
@@ -119,6 +121,7 @@ class RemoteChat {
     this.rpc = createRpcClient({
       url: options.consumerUrl,
       secret: options.secret,
+      headers: options.headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
     });

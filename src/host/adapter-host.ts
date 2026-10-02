@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import type {
   Adapter,
   AdapterPostableMessage,
@@ -41,6 +43,7 @@ import {
   type StreamEnding,
 } from "../rpc/methods";
 import { createReplayGuard } from "../rpc/security";
+import { HANDSHAKE_HEADER, type Secret } from "../rpc/signing";
 import type { FetchLike, HostEvent } from "../types";
 import type { LogLevel } from "./logger-bridge";
 import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
@@ -108,8 +111,11 @@ export interface ServeAdapterOptions extends DispatchOptions {
   stream?: StreamModeOptions;
 }
 
-function requireOption(value: string | undefined, option: string): string {
-  if (!value) {
+function requireOption<T extends Secret>(
+  value: T | undefined,
+  option: string,
+): T {
+  if (!value?.length) {
     const variable = option === "secret" ? "SECRET" : "CONSUMER_URL";
     throw new ValidationError(
       "remote",
@@ -146,6 +152,8 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private readonly customMethods: string[];
   private unguard?: () => void;
   private readonly redelivery?: Redelivery;
+  private readonly memoryQueue?: ForwardQueue;
+  private readonly dropped: DroppedForwardHandler;
   private readonly toConsumer: RpcClient;
   private readonly streams: StreamRegistry;
   private readonly streamer?: ReturnType<typeof createStreamer>;
@@ -206,19 +214,23 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       );
       options.onDropped?.(entry, reason, error);
     };
+    this.dropped = dropped;
+    const headers = () => ({ [HANDSHAKE_HEADER]: this.fingerprint() });
     this.toConsumer = createRpcClient({
       url: consumerUrl,
       secret,
+      headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
     });
     if (options.forwardRetry !== false) {
-      this.redelivery = new Redelivery({
-        queue:
-          options.forwardQueue ??
-          createMemoryForwardQueue((entry) =>
+      this.memoryQueue = options.forwardQueue
+        ? undefined
+        : createMemoryForwardQueue((entry) =>
             dropped(entry, "overflow", undefined),
-          ),
+          );
+      this.redelivery = new Redelivery({
+        queue: options.forwardQueue ?? this.memoryQueue!,
         ...options.forwardRetry,
         send: (method, params) => this.toConsumer.request(method, params),
         isUndelivered,
@@ -229,6 +241,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     this.chat = createRemoteChat({
       consumerUrl,
       secret,
+      headers,
       timeoutMs: options.timeoutMs,
       logger: this.logger,
       fetch: options.fetch,
@@ -282,6 +295,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   async stop(): Promise<void> {
     this.stopped = true;
     this.redelivery?.stop();
+    const stranded = await this.memoryQueue?.takeDue(Number.POSITIVE_INFINITY);
+    for (const entry of stranded ?? [])
+      this.dropped(entry, "stopped", undefined);
     this.unguard?.();
     this.unguard = undefined;
     this.streams.clear();
@@ -317,14 +333,14 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
 
   async handleRequest(request: Request): Promise<Response> {
     // An unhandled rejection here would end the process holding the connection.
-    try {
-      return await this.route(request);
-    } catch (error) {
+    const response = await this.route(request).catch((error: unknown) => {
       this.logger.error("request could not be handled", { error });
       this.options.onError?.(error, { phase: "dispatch" });
       const wire = serializeError(error);
       return failure(null, wire.code, wire.message, wire.data);
-    }
+    });
+    response.headers.set(HANDSHAKE_HEADER, this.fingerprint());
+    return response;
   }
 
   private async route(request: Request): Promise<Response> {
@@ -370,6 +386,32 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     }
   }
 
+  private handshake() {
+    const adapter = this.adapter;
+    return {
+      protocolVersion: PROTOCOL_VERSION,
+      name: adapter.name,
+      userName: adapter.userName,
+      attachments: () => this.attachmentPolicy(),
+      botUserId: adapter.botUserId,
+      lockScope: adapter.lockScope,
+      persistThreadHistory:
+        adapter.persistThreadHistory ?? adapter.persistMessageHistory,
+      supportsTurnCancellation: adapter.supportsTurnCancellation,
+      capabilities: this.capabilities,
+      customMethods: this.customMethods,
+    };
+  }
+
+  /** Shared by replicas set up alike, so only a real change makes the consumer handshake again. */
+  private fingerprint(): string {
+    return crypto
+      .createHash("sha256")
+      .update(JSON.stringify(this.handshake()))
+      .digest("hex")
+      .slice(0, 16);
+  }
+
   private attachmentPolicy(): AttachmentPolicy {
     return {
       budget: new AttachmentBudget(
@@ -405,19 +447,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
 
     switch (call.method) {
       case "__handshake":
-        return {
-          protocolVersion: PROTOCOL_VERSION,
-          name: adapter.name,
-          userName: adapter.userName,
-          attachments: () => this.attachmentPolicy(),
-          botUserId: adapter.botUserId,
-          lockScope: adapter.lockScope,
-          persistThreadHistory:
-            adapter.persistThreadHistory ?? adapter.persistMessageHistory,
-          supportsTurnCancellation: adapter.supportsTurnCancellation,
-          capabilities: this.capabilities,
-          customMethods: this.customMethods,
-        };
+        return this.handshake();
       case "postMessage":
         return adapter.postMessage(first, params[1] as AdapterPostableMessage);
       case "editMessage":

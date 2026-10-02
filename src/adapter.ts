@@ -53,6 +53,7 @@ import {
   type StateOperation,
 } from "./rpc/methods";
 import { createReplayGuard, type ReplayGuard } from "./rpc/security";
+import { HANDSHAKE_HEADER, type Secret } from "./rpc/signing";
 import { createRpcClient, type RpcClient } from "./rpc/transport";
 import { translateIds, translateParams } from "./thread-ids";
 import type { HostEvent, RemoteAdapterConfig } from "./types";
@@ -78,8 +79,11 @@ type InboundEvent = Exclude<
   { method: "log" }
 >;
 
-function requireOption(value: string | undefined, option: string): string {
-  if (!value) {
+function requireOption<T extends Secret>(
+  value: T | undefined,
+  option: string,
+): T {
+  if (!value?.length) {
     const variable = option === "url" ? "URL" : "SECRET";
     throw new ValidationError(
       "remote",
@@ -120,8 +124,9 @@ export class RemoteAdapter<
   private readonly link: RpcClient;
   private readonly logger: Logger;
   private readonly replayGuard: ReplayGuard;
-  private readonly secret: string;
+  private readonly secret: Secret;
   private handshaken = false;
+  private hostHandshake?: string;
   private hostName?: string;
   private streams = true;
   private handshaking?: Promise<void>;
@@ -143,11 +148,16 @@ export class RemoteAdapter<
       config.logger ?? new ConsoleLogger("info", "chat-adapter-remote");
     this.maxCachedThreads = config.maxCachedThreads ?? DEFAULT_THREAD_CACHE;
     this.replayGuard = config.replayGuard ?? createReplayGuard();
+    const doFetch = config.fetch ?? fetch;
     this.link = createRpcClient({
       url,
       secret: this.secret,
       timeoutMs: config.timeoutMs,
-      fetch: config.fetch,
+      fetch: async (input, init) => {
+        const response = await doFetch(input, init);
+        this.observeHost(response.headers);
+        return response;
+      },
     });
     this.rpc = {
       request: async (method, params) => {
@@ -204,12 +214,21 @@ export class RemoteAdapter<
   }
 
   /** Chat checks `adapter.x?.()`, so what the host did not report is removed. */
+  /** A host reloaded with other capabilities, names or adapter: the next call handshakes again. */
+  private observeHost(headers: Headers): void {
+    const fingerprint = headers.get(HANDSHAKE_HEADER);
+    if (!fingerprint || fingerprint === this.hostHandshake) return;
+    if (this.hostHandshake) this.handshaken = false;
+    this.hostHandshake = fingerprint;
+  }
   private applyCapabilities(capabilities?: string[]): void {
     if (!capabilities) return;
     const supported = new Set(capabilities);
     this.streams = supported.has("stream");
+    // Hiding shadows the method; deleting the shadow brings it back after a re-handshake.
     for (const name of OPTIONAL_CAPABILITIES) {
-      if (!supported.has(name)) Reflect.set(this, name, undefined);
+      if (supported.has(name)) Reflect.deleteProperty(this, name);
+      else Reflect.set(this, name, undefined);
     }
   }
 
@@ -745,6 +764,7 @@ export class RemoteAdapter<
       replayGuard: this.replayGuard,
     });
     if (!verified.ok) return verified.response;
+    this.observeHost(request.headers);
 
     const call = INBOUND_CALLS.safeParse({
       method: verified.method,

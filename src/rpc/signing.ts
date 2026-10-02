@@ -3,6 +3,15 @@ import crypto from "node:crypto";
 export const SIGNATURE_HEADER = "x-chat-adapter-remote-signature";
 export const TIMESTAMP_HEADER = "x-chat-adapter-remote-timestamp";
 export const NONCE_HEADER = "x-chat-adapter-remote-nonce";
+/** A digest of what the host's handshake reports. Unsigned: a forged one only costs a signed handshake. */
+export const HANDSHAKE_HEADER = "x-chat-adapter-remote-handshake";
+
+/** Several while rotating: the first signs, any of them verifies. */
+export type Secret = string | readonly string[];
+
+export function secretsOf(secret: Secret): readonly string[] {
+  return typeof secret === "string" ? [secret] : secret;
+}
 
 /** The nonce keeps identical calls from separate instances, signed in the same millisecond, from reading as replays. */
 export function sign(
