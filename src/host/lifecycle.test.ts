@@ -10,6 +10,7 @@ import {
   bridge,
   deferred,
   handshake,
+  message,
 } from "../testing/bridge";
 
 const options = {
@@ -154,5 +155,120 @@ describe("log forwarding", () => {
     (b.hostChat() as ChatInstance).getLogger("baileys").warn("reconnecting");
 
     expect(await logged.promise).toBe("reconnecting");
+  });
+});
+
+describe("health", () => {
+  const probe = async (fetch: (request: Request) => Promise<Response>) => {
+    const response = await fetch(
+      new Request("https://host.test/rpc", { method: "GET" }),
+    );
+    return { status: response.status, body: await response.json() };
+  };
+
+  it("answers probes with the host's state, unsigned", async () => {
+    const host = createAdapterHost(createMockAdapter("mock"), options);
+    expect(await probe(host.fetch)).toMatchObject({
+      status: 503,
+      body: { status: "idle" },
+    });
+
+    await host.start();
+    expect(await probe(host.fetch)).toEqual({
+      status: 200,
+      body: { status: "ready", openStreams: 0, queuedForwards: 0 },
+    });
+
+    await host.stop();
+    expect(await probe(host.fetch)).toMatchObject({
+      status: 503,
+      body: { status: "stopped" },
+    });
+  });
+
+  it("reports an adapter that failed to start", async () => {
+    const host = createAdapterHost(
+      createMockAdapter("mock", {
+        initialize: vi.fn().mockRejectedValue(new Error("logged out")),
+      }),
+      options,
+    );
+    await host.start().catch(() => undefined);
+
+    expect(await probe(host.fetch)).toMatchObject({
+      status: 503,
+      body: { status: "failed" },
+    });
+  });
+
+  it("counts the forwards waiting for the consumer", async () => {
+    let chat!: ChatInstance;
+    const adapter = createMockAdapter("mock", {
+      initialize: vi.fn(
+        async (instance: ChatInstance) => void (chat = instance),
+      ),
+    });
+    const host = serveAdapter(adapter, {
+      ...options,
+      fetch: vi.fn().mockRejectedValue(new TypeError("fetch failed")),
+    });
+    await host.ready;
+
+    await chat.processMessage(adapter, "mock:c:1", message("while down"));
+
+    expect(await host.health()).toMatchObject({ queuedForwards: 1 });
+  });
+});
+
+describe("request hooks", () => {
+  it("reports each request on both sides, with its method and duration", async () => {
+    const hostSide: unknown[] = [];
+    const consumerSide: unknown[] = [];
+    const b = bridge(
+      {},
+      { onRequest: (event) => hostSide.push(event) },
+      { onRequest: (event) => consumerSide.push(event) },
+    );
+    await handshake(b);
+
+    await b.remote.postMessage("mock:c:1", "hi");
+
+    const call = { method: "postMessage", ms: expect.any(Number) };
+    expect(consumerSide).toContainEqual({ direction: "sent", ...call });
+    expect(hostSide).toContainEqual({ direction: "received", ...call });
+  });
+
+  it("includes the error of a failed request", async () => {
+    const events: Array<{ method: string; error?: unknown }> = [];
+    const b = bridge(
+      { postMessage: vi.fn().mockRejectedValue(new Error("rejected")) },
+      { onRequest: (event) => events.push(event) },
+    );
+    await handshake(b);
+
+    await expect(b.remote.postMessage("mock:c:1", "hi")).rejects.toThrow();
+
+    expect(
+      events.find((event) => event.method === "postMessage")?.error,
+    ).toBeInstanceOf(Error);
+  });
+
+  it("never lets a failing hook fail the request", async () => {
+    const b = bridge(
+      {},
+      {
+        onRequest: () => {
+          throw new Error("metrics down");
+        },
+      },
+      {
+        onRequest: () => {
+          throw new Error("metrics down");
+        },
+      },
+    );
+    await handshake(b);
+
+    await expect(b.remote.postMessage("mock:c:1", "hi")).resolves.toBeDefined();
   });
 });

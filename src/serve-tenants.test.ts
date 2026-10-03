@@ -84,6 +84,16 @@ describe("adding and removing adapters at runtime", () => {
     );
   });
 
+  it("answers a probe per tenant, and 404 for one not served", async () => {
+    const hosts = serveAdapters({});
+    await hosts.add("ch", entry(createMockAdapter("whatsapp")));
+    const probe = (name: string) =>
+      hosts.fetch(new Request(`https://host.test/rpc/${name}`));
+
+    expect((await probe("ch")).status).toBe(200);
+    expect((await probe("other")).status).toBe(404);
+  });
+
   it("does not keep an adapter that fails to start", async () => {
     const hosts = serveAdapters({});
     const broken = createMockAdapter("whatsapp", {

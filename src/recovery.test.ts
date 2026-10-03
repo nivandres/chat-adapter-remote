@@ -5,9 +5,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createRemoteAdapter } from "./adapter";
 import { serveAdapter } from "./host";
+import { CallLedger } from "./host/call-ledger";
 import { RpcErrorCode } from "./rpc/errors";
 import { CONSUMER_URL, HOST_URL, SECRET, message } from "./testing/bridge";
-import type { FetchLike } from "./types";
+import type { FetchLike, RemoteAdapterConfig } from "./types";
 
 const THREAD = "mock:general:1";
 
@@ -387,5 +388,146 @@ describe("redelivery", () => {
     expect(pushed).toHaveLength(1);
     // JSON-safe, so a shared store can hold it.
     expect(() => JSON.stringify(pushed[0])).not.toThrow();
+  });
+});
+
+/** Reaches the host the way a network does: an abort fails the caller while the host carries on. */
+function slowHost(delayMs: number) {
+  const adapter = createMockAdapter("mock", {
+    postMessage: vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return { id: "posted", threadId: THREAD, raw: {} };
+    }),
+  });
+  const host = serveAdapter(adapter, {
+    secret: SECRET,
+    consumerUrl: CONSUMER_URL,
+    fetch: vi.fn(),
+  });
+  const link = { unreachable: 0, sent: 0, idempotent: true };
+  const fetch: FetchLike = async (input, init) => {
+    link.sent++;
+    if (link.unreachable > 0) {
+      link.unreachable--;
+      throw new TypeError("fetch failed");
+    }
+    const answered = new Promise<Response>((resolve, reject) => {
+      init?.signal?.addEventListener("abort", () =>
+        reject(new DOMException("aborted", "AbortError")),
+      );
+      host.handleRequest(new Request(input, init)).then(resolve, reject);
+    });
+    if (link.idempotent || !String(init?.body).includes("__handshake")) {
+      return answered;
+    }
+    // A host from before 0.8.3, which never announced it.
+    const body = await (await answered).json();
+    delete body.result.idempotentCalls;
+    return Response.json(body);
+  };
+  const consumer = (options: Partial<RemoteAdapterConfig> = {}) =>
+    createRemoteAdapter({
+      url: HOST_URL,
+      secret: SECRET,
+      name: "mock",
+      fetch,
+      timeoutMs: 30,
+      retry: { intervalMs: 0, maxAttempts: 5 },
+      ...options,
+    });
+  return { adapter, link, consumer };
+}
+
+describe("retries", () => {
+  it("answers a call that outlived its timeout, running it once however often it is retried", async () => {
+    const h = slowHost(80);
+
+    await expect(
+      h.consumer().postMessage(THREAD, "slow"),
+    ).resolves.toMatchObject({ id: "posted" });
+    // The handshake, then more than one try at the call.
+    expect(h.link.sent).toBeGreaterThan(2);
+    expect(h.adapter.postMessage).toHaveBeenCalledOnce();
+  });
+
+  it("sends again a call that never arrived", async () => {
+    const h = slowHost(0);
+    const remote = h.consumer();
+    await remote.postMessage(THREAD, "first");
+
+    h.link.unreachable = 1;
+    await expect(remote.postMessage(THREAD, "second")).resolves.toBeDefined();
+    expect(h.adapter.postMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry against a host that would run the call twice", async () => {
+    const h = slowHost(80);
+    h.link.idempotent = false;
+
+    await expect(
+      h.consumer().postMessage(THREAD, "slow"),
+    ).rejects.toMatchObject({ code: RpcErrorCode.TIMEOUT });
+    expect(h.link.sent).toBe(2);
+  });
+
+  it("does not retry when told not to", async () => {
+    const h = slowHost(80);
+
+    await expect(
+      h.consumer({ retry: false }).postMessage(THREAD, "slow"),
+    ).rejects.toMatchObject({ code: RpcErrorCode.TIMEOUT });
+    expect(h.link.sent).toBe(2);
+  });
+
+  it("never retries an answer, only the lack of one", async () => {
+    const h = slowHost(0);
+    vi.mocked(h.adapter.postMessage).mockRejectedValue(new Error("rejected"));
+
+    await expect(h.consumer().postMessage(THREAD, "x")).rejects.toThrow();
+    expect(h.adapter.postMessage).toHaveBeenCalledOnce();
+  });
+});
+
+describe("call ledger", () => {
+  it("runs a call once per id, and every time for reads and older consumers", async () => {
+    const ledger = new CallLedger();
+    const call = vi.fn(async () => "done");
+
+    await ledger.run("a", "postMessage", call);
+    await ledger.run("a", "postMessage", call);
+    expect(call).toHaveBeenCalledTimes(1);
+
+    await ledger.run(1, "postMessage", call);
+    await ledger.run(1, "postMessage", call);
+    await ledger.run("b", "fetchMessages", call);
+    await ledger.run("b", "fetchMessages", call);
+    expect(call).toHaveBeenCalledTimes(5);
+  });
+
+  it("gives a retry the first outcome, failures included", async () => {
+    const ledger = new CallLedger();
+    const call = vi.fn(async () => {
+      throw new Error("rate limited");
+    });
+
+    await expect(ledger.run("a", "postMessage", call)).rejects.toThrow();
+    await expect(ledger.run("a", "postMessage", call)).rejects.toThrow();
+    expect(call).toHaveBeenCalledOnce();
+  });
+
+  it("forgets a finished call once its window has passed", async () => {
+    vi.useFakeTimers();
+    try {
+      const ledger = new CallLedger();
+      const call = vi.fn(async () => "done");
+      await ledger.run("a", "postMessage", call);
+
+      vi.advanceTimersByTime(130_000);
+      await ledger.run("a", "postMessage", call);
+
+      expect(call).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
