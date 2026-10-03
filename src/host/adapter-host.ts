@@ -79,7 +79,7 @@ export interface ServeAdapterOptions extends DispatchOptions {
   onError?: HostErrorHandler;
   /** Called once the wrapped adapter has initialized. */
   onReady?: () => void;
-  /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
+  /** Lines below this level stay on the host instead of crossing the wire. Default "warn". */
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
   maxConcurrentForwards?: number;
@@ -222,6 +222,10 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
+      onSkipped: (count) =>
+        this.logger.warn(
+          `skipped ${count} event(s) while the consumer was unreachable or backed up`,
+        ),
     });
     if (options.forwardRetry !== false) {
       this.memoryQueue = options.forwardQueue

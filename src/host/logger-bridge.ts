@@ -18,14 +18,14 @@ export interface BridgingLoggerOptions {
     message: string,
     args: unknown[],
   ) => void;
-  /** Lines below this level stay local instead of crossing the wire. Default "info". */
+  /** Lines below this level stay local instead of crossing the wire. Default "warn". */
   forwardLevel?: LogLevel;
 }
 
 /** Logs locally and mirrors lines at or above `forwardLevel` to the consumer. */
 export function createBridgingLogger(options: BridgingLoggerOptions): Logger {
   const prefix = options.prefix ?? "";
-  const threshold = RANK[options.forwardLevel ?? "info"];
+  const threshold = RANK[options.forwardLevel ?? "warn"];
 
   function log(level: LogLevel, message: string, args: unknown[]): void {
     options.localLogger[level](message, ...args);

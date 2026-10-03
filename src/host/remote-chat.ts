@@ -56,7 +56,7 @@ export interface RemoteChatOptions {
   dropped?: DroppedForwardHandler;
   attachments?: () => AttachmentPolicy;
   state?: StateAdapter;
-  /** Lines below this level stay on the host instead of crossing the wire. Default "info". */
+  /** Lines below this level stay on the host instead of crossing the wire. Default "warn". */
   logForwardLevel?: LogLevel;
   /** Inbound messages forwarded at once. Default 8. */
   maxConcurrentForwards?: number;
@@ -124,6 +124,10 @@ class RemoteChat {
       headers: options.headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
+      onSkipped: (count) =>
+        this.getLogger().warn(
+          `skipped ${count} log line(s) while the consumer was unreachable or backed up`,
+        ),
     });
   }
 
