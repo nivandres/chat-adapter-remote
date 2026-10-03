@@ -111,6 +111,8 @@ The host's `stream.mode` can stream for an adapter that has none. `"buffer"` gat
 
 A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default, and what it still holds when the host stops is reported as `"stopped"`; pass a `forwardQueue` to keep it somewhere shared, across restarts and reloads. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
 
+Log lines and `host.emit()` events are best effort, never retried. Lines from `"warn"` up cross by default (`logForwardLevel`). While the consumer is unreachable they stay on the host and are counted, and the count is reported once it answers again, so an adapter stuck in a reconnect loop cannot flood it.
+
 A consumer that starts while the host is down recovers on its own: each call tries again, rather than failing for good. When the host comes back with a different setup — another adapter, name, stream mode or set of methods — the consumer handshakes again on its next call; a restart with the same setup costs nothing.
 
 Chat serializes work per thread and drops by default, so a burst on a single thread mostly does not reach your handlers — set a `queue` concurrency strategy on the consumer's `Chat` if you need every message. This matters here because a host draining a backlog after a reconnect sends exactly that shape of burst.
@@ -127,7 +129,7 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 
 ## Limits
 
-No batching of forwarded logs. Signing uses `node:crypto` and the codec uses `Buffer`, so neither side runs on edge runtimes without a Node compatibility layer.
+Forwarded log lines are not batched. Signing uses `node:crypto` and the codec uses `Buffer`, so neither side runs on edge runtimes without a Node compatibility layer.
 
 ## License
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.2
+
+### Fixed
+
+- An adapter stuck in a reconnect loop while the consumer was down turned every log line into its own failing request — about 685,000 in 24 minutes in one deployment. Log lines and `host.emit()` events are best effort and never retried: after one fails to arrive, the next ones stay on the host for 30 seconds, then a single one probes, and at most 16 wait for an answer at a time. The number skipped is reported once the consumer answers again.
+
+### Changed
+
+- `logForwardLevel` defaults to `"warn"`. Most `info` lines from an adapter are noise to the consumer; pass `"info"` to keep them crossing.
+
 ## 0.8.1
 
 Changing things at runtime — reloading a tenant, restarting or reconfiguring a host, rotating the secret — no longer breaks calls in flight or leaves the consumer on stale facts. Compatible with 0.8.0 on either side.
