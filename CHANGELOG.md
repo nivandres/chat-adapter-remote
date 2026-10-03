@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.3
+
+Compatible with 0.8 on either side; retries take effect once both sides run 0.8.3.
+
+### Added
+
+- A consumer call that gets no answer is tried again (`retry`, three tries a second apart by default; `false` disables). Every try carries the same id, and the host remembers each call that changes something for two minutes after it finishes, so a retry gets the first outcome instead of running the call again. A `postMessage` that outlived its timeout is answered once it lands, rather than failing and being posted twice when its caller tried again.
+- A `GET` on the host's route, and `host.health()`: lifecycle status, open streams and queued forwards, answering 200 once the adapter is ready and 503 otherwise.
+- `onRequest` on both sides: every request sent or received, with its direction, method, duration and error. A hook that throws never fails the request.
+- `ForwardQueue` may implement `size()`, reported by health.
+
 ## 0.8.2
 
 ### Fixed

@@ -74,6 +74,8 @@ process.on("SIGTERM", () => host.stop());
 
 `start()` is idempotent; `ready` is shorthand for it. `stop()` disconnects the adapter, drops open streams, and refuses further dispatch. `onError` covers the `initialize`, `forward`, `dispatch`, `shutdown` and `adapter` phases.
 
+A `GET` on the host's route answers `{ status, openStreams, queuedForwards }`, 200 once the adapter is ready and 503 otherwise, for health probes; it is unsigned and tells nothing else. `onRequest`, on either side, receives every request with its direction, method, duration and error, for metrics.
+
 `host.emit({ type: "qr", code })` reaches the consumer's `onEvent`, for showing a pairing QR or connection state in your own UI.
 
 `serveAdapters({ [name]: { adapter, secret, consumerUrl } })` runs several adapters in one process, each reached at `/<path>/<name>` with its own secret; one that fails to connect leaves the others running. `hosts.add(name, entry)` and `hosts.remove(name)` change them at runtime.
@@ -112,6 +114,8 @@ The host's `stream.mode` can stream for an adapter that has none. `"buffer"` gat
 A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default, and what it still holds when the host stops is reported as `"stopped"`; pass a `forwardQueue` to keep it somewhere shared, across restarts and reloads. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
 
 Log lines and `host.emit()` events are best effort, never retried. Lines from `"warn"` up cross by default (`logForwardLevel`). While the consumer is unreachable they stay on the host and are counted, and the count is reported once it answers again, so an adapter stuck in a reconnect loop cannot flood it.
+
+A call from the consumer that gets no answer — the host unreachable, or slower than `timeoutMs` — is tried again, up to three times a second apart (`retry`). Every try carries the same id and the host runs the call once, giving each try its outcome, so a retry never posts twice. Against a host older than 0.8.3 nothing is retried.
 
 A consumer that starts while the host is down recovers on its own: each call tries again, rather than failing for good. When the host comes back with a different setup — another adapter, name, stream mode or set of methods — the consumer handshakes again on its next call; a restart with the same setup costs nothing.
 
