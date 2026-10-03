@@ -65,6 +65,8 @@ export const HandshakeSchema = z
     supportsTurnCancellation: z.boolean().optional(),
     capabilities: z.array(z.string()).optional(),
     customMethods: z.array(z.string()).optional(),
+    /** The host answers a retried call with its first outcome, so retrying is safe. */
+    idempotentCalls: z.boolean().optional(),
   })
   .passthrough();
 

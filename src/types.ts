@@ -17,6 +17,25 @@ export interface HostEvent {
   [key: string]: unknown;
 }
 
+/** One request between the two sides, for metrics and tracing. */
+export interface RequestEvent {
+  /** `sent`: this side called the other; `received`: the other side called this one. */
+  direction: "sent" | "received";
+  method: string;
+  ms: number;
+  /** Absent when it succeeded. */
+  error?: unknown;
+}
+
+export type RequestHandler = (event: RequestEvent) => void;
+
+export interface RetryOptions {
+  /** Tries per call, the first included. Default 3. */
+  maxAttempts?: number;
+  /** Wait between tries. Default 1 second. */
+  intervalMs?: number;
+}
+
 export interface RemoteAdapterErrorContext {
   method: string;
 }
@@ -50,6 +69,10 @@ export interface RemoteAdapterConfig {
   replayGuard?: ReplayGuard;
   /** Thread facts kept in memory. Default 1000. */
   maxCachedThreads?: number;
+  /** Tries again a call that got no answer, only against a host that answers a retry once. `false` disables. */
+  retry?: RetryOptions | false;
+  /** Every request sent or received. */
+  onRequest?: RequestHandler;
   logger?: Logger;
   fetch?: FetchLike;
 }

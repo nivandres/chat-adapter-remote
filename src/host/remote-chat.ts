@@ -20,6 +20,7 @@ import { serializeMessage, type AttachmentPolicy } from "../rpc/message-wire";
 import { EVENT_MESSAGE_KEYS } from "../rpc/methods";
 import type { Secret } from "../rpc/signing";
 import { createRpcClient, type RpcClient } from "../rpc/transport";
+import type { RequestHandler } from "../types";
 import { createBridgingLogger, type LogLevel } from "./logger-bridge";
 import {
   forwardEntry,
@@ -46,6 +47,7 @@ export interface RemoteChatOptions {
   consumerUrl: string;
   secret: Secret;
   headers?: () => Record<string, string>;
+  onRequest?: RequestHandler;
   timeoutMs?: number;
   logger?: Logger;
   fetch?: FetchLike;
@@ -124,6 +126,7 @@ class RemoteChat {
       headers: options.headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
+      onRequest: options.onRequest,
       onSkipped: (count) =>
         this.getLogger().warn(
           `skipped ${count} log line(s) while the consumer was unreachable or backed up`,

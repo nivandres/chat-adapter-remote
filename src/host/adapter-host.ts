@@ -22,7 +22,7 @@ import { ConsoleLogger } from "chat";
 
 import { decode, encode } from "../rpc/codec";
 import { verifyRequest, type DispatchOptions } from "../rpc/dispatch";
-import { createRpcClient, type RpcClient } from "../rpc/transport";
+import { createRpcClient, observe, type RpcClient } from "../rpc/transport";
 import {
   RemoteAdapterRpcError,
   RpcErrorCode,
@@ -44,7 +44,8 @@ import {
 } from "../rpc/methods";
 import { createReplayGuard } from "../rpc/security";
 import { HANDSHAKE_HEADER, type Secret } from "../rpc/signing";
-import type { FetchLike, HostEvent } from "../types";
+import type { FetchLike, HostEvent, RequestHandler } from "../types";
+import { CallLedger } from "./call-ledger";
 import type { LogLevel } from "./logger-bridge";
 import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
 import {
@@ -77,6 +78,8 @@ export interface ServeAdapterOptions extends DispatchOptions {
   fetch?: FetchLike;
   /** Receives failures from every phase. */
   onError?: HostErrorHandler;
+  /** Every request sent or received. */
+  onRequest?: RequestHandler;
   /** Called once the wrapped adapter has initialized. */
   onReady?: () => void;
   /** Lines below this level stay on the host instead of crossing the wire. Default "warn". */
@@ -139,6 +142,14 @@ function failure(
   return Response.json({ jsonrpc: "2.0", id, error: { code, message, data } });
 }
 
+export interface HostHealth {
+  /** `ready` once the adapter has initialized; probes get 503 for anything else. */
+  status: "idle" | "starting" | "ready" | "failed" | "stopped";
+  openStreams: number;
+  /** Forwards waiting to be sent again; absent when the queue cannot count. */
+  queuedForwards?: number;
+}
+
 /** Serves a real adapter over signed HTTP JSON-RPC. */
 export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   /** Bound, so it can be handed straight to any Fetch-API router. */
@@ -160,7 +171,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private readonly attachments: AttachmentRegistry;
   private readonly scheduled = new Map<string, ScheduledMessage<TRawMessage>>();
   private starting?: Promise<void>;
+  private outcome?: "ready" | "failed";
   private stopped = false;
+  private readonly ledger = new CallLedger();
 
   constructor(
     private readonly adapter: Adapter<TThreadId, TRawMessage>,
@@ -222,6 +235,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
+      onRequest: options.onRequest,
       onSkipped: (count) =>
         this.logger.warn(
           `skipped ${count} event(s) while the consumer was unreachable or backed up`,
@@ -246,6 +260,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       consumerUrl,
       secret,
       headers,
+      onRequest: options.onRequest,
       timeoutMs: options.timeoutMs,
       logger: this.logger,
       fetch: options.fetch,
@@ -288,8 +303,10 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     try {
       await this.options.state?.connect();
       await this.adapter.initialize(this.chat);
+      this.outcome = "ready";
       this.options.onReady?.();
     } catch (error) {
+      this.outcome = "failed";
       this.options.onError?.(error, { phase: "initialize" });
       throw error;
     }
@@ -307,6 +324,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     this.streams.clear();
     this.scheduled.clear();
     this.attachments.clear();
+    this.ledger.clear();
     try {
       await this.adapter.disconnect?.();
       await this.options.state?.disconnect();
@@ -314,6 +332,20 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       this.options.onError?.(error, { phase: "shutdown" });
       throw error;
     }
+  }
+
+  /** Lifecycle and backlog, for probes and dashboards. */
+  async health(): Promise<HostHealth> {
+    const queue = this.redelivery
+      ? (this.options.forwardQueue ?? this.memoryQueue)
+      : undefined;
+    return {
+      status: this.stopped
+        ? "stopped"
+        : (this.outcome ?? (this.starting ? "starting" : "idle")),
+      openStreams: this.streams.size,
+      queuedForwards: await queue?.size?.().catch(() => undefined),
+    };
   }
 
   /** Reaches the consumer's `onEvent`. Best effort, never retried. */
@@ -336,6 +368,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   }
 
   async handleRequest(request: Request): Promise<Response> {
+    if (request.method === "GET") return this.probe();
     // An unhandled rejection here would end the process holding the connection.
     const response = await this.route(request).catch((error: unknown) => {
       this.logger.error("request could not be handled", { error });
@@ -376,10 +409,22 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       );
     }
 
+    const started = Date.now();
     try {
       await this.start();
-      return success(id, await encode(await this.dispatch(call.data)));
+      const result = await this.ledger.run(id, call.data.method, () =>
+        this.dispatch(call.data),
+      );
+      observe(this.options.onRequest, "received", call.data.method, started);
+      return success(id, await encode(result));
     } catch (error) {
+      observe(
+        this.options.onRequest,
+        "received",
+        call.data.method,
+        started,
+        error,
+      );
       if (!(error instanceof StreamDiscardedError)) {
         // The wire form is sanitised, so this is the only full record.
         this.logger.error(`${call.data.method} failed`, { error });
@@ -404,7 +449,16 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       supportsTurnCancellation: adapter.supportsTurnCancellation,
       capabilities: this.capabilities,
       customMethods: this.customMethods,
+      idempotentCalls: true,
     };
+  }
+
+  /** Unsigned, so it answers with state and counts only. */
+  private async probe(): Promise<Response> {
+    const health = await this.health();
+    return Response.json(health, {
+      status: health.status === "ready" ? 200 : 503,
+    });
   }
 
   /** Shared by replicas set up alike, so only a real change makes the consumer handshake again. */

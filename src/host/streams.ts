@@ -88,6 +88,10 @@ export class StreamRegistry {
   private sweeper?: ReturnType<typeof setInterval>;
   private sequence = 0;
 
+  get size(): number {
+    return this.streams.size;
+  }
+
   constructor(options: StreamRegistryOptions = {}) {
     this.ttlMs = options.ttlMs ?? 300_000;
     this.startTimeoutMs = options.startTimeoutMs ?? 10_000;

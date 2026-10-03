@@ -14,7 +14,7 @@ import {
   sign,
   type Secret,
 } from "./signing";
-import type { FetchLike } from "../types";
+import type { FetchLike, RequestHandler, RequestEvent } from "../types";
 
 /** How long notifications are skipped after one fails to arrive. */
 const NOTIFY_PAUSE_MS = 30_000;
@@ -31,10 +31,27 @@ export interface RpcClientOptions {
   fetch?: FetchLike;
   /** Notifications skipped while the far side was unreachable or backed up, reported once one arrives again. */
   onSkipped?: (count: number) => void;
+  onRequest?: RequestHandler;
+}
+
+/** A failing hook must not fail the request it observes. */
+export function observe(
+  hook: RequestHandler | undefined,
+  direction: RequestEvent["direction"],
+  method: string,
+  started: number,
+  error?: unknown,
+): void {
+  try {
+    hook?.({ direction, method, ms: Date.now() - started, error });
+  } catch {
+    // Observing is optional; the request it reports on is not.
+  }
 }
 
 export interface RpcClient {
-  request(method: string, params: unknown): Promise<unknown>;
+  /** A retry passes the first try's id, so the far side can tell it is the same call. */
+  request(method: string, params: unknown, id?: string): Promise<unknown>;
   /** Best effort: never retried, and skipped while the far side is unreachable. Never throws and never rejects. */
   notify(method: string, params: unknown): void;
 }
@@ -43,7 +60,6 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   const doFetch = options.fetch ?? fetch;
   const timeoutMs = options.timeoutMs ?? 10_000;
   const maxBodyBytes = options.maxBodyBytes ?? Number.POSITIVE_INFINITY;
-  let nextId = 1;
   let pausedUntil = 0;
   let inFlight = 0;
   let skipped = 0;
@@ -59,7 +75,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
   async function send(
     method: string,
     params: unknown,
-    id?: number,
+    id?: string,
   ): Promise<Response> {
     const body = JSON.stringify({
       jsonrpc: "2.0",
@@ -107,48 +123,63 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     }
   }
 
+  async function exchange(
+    method: string,
+    params: unknown,
+    id: string,
+  ): Promise<unknown> {
+    const response = await send(method, params, id);
+    const text = await readBody(response, maxBodyBytes);
+    if (text === null) {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.INVALID_REQUEST,
+        `chat-adapter-remote: response larger than ${maxBodyBytes} bytes`,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = undefined;
+    }
+    // Never handled, so the one case a caller can safely retry.
+    if (response.status >= 500) {
+      const reason = (parsed as { error?: { message?: string } } | undefined)
+        ?.error?.message;
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.UNAVAILABLE,
+        `chat-adapter-remote: ${method} answered HTTP ${response.status}${reason ? ` (${reason})` : ""}`,
+      );
+    }
+    if (parsed === undefined) {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.INTERNAL_ERROR,
+        `chat-adapter-remote: non-JSON response (HTTP ${response.status})`,
+      );
+    }
+    const envelope = JsonRpcResponseSchema.parse(parsed);
+    // Pre-parse rejections answer with `id: null`, so read the error first.
+    if (isErrorResponse(envelope)) throw deserializeError(envelope.error);
+    if (envelope.id !== id) {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.INTERNAL_ERROR,
+        "chat-adapter-remote: response id did not match request",
+      );
+    }
+    return decode(envelope.result);
+  }
+
   return {
-    async request(method, params) {
-      const id = nextId++;
-      const response = await send(method, params, id);
-      const text = await readBody(response, maxBodyBytes);
-      if (text === null) {
-        throw new RemoteAdapterRpcError(
-          RpcErrorCode.INVALID_REQUEST,
-          `chat-adapter-remote: response larger than ${maxBodyBytes} bytes`,
-        );
-      }
-      let parsed: unknown;
+    async request(method, params, id = crypto.randomUUID()) {
+      const started = Date.now();
       try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = undefined;
+        const result = await exchange(method, params, id);
+        observe(options.onRequest, "sent", method, started);
+        return result;
+      } catch (error) {
+        observe(options.onRequest, "sent", method, started, error);
+        throw error;
       }
-      // Never handled, so the one case a caller can safely retry.
-      if (response.status >= 500) {
-        const reason = (parsed as { error?: { message?: string } } | undefined)
-          ?.error?.message;
-        throw new RemoteAdapterRpcError(
-          RpcErrorCode.UNAVAILABLE,
-          `chat-adapter-remote: ${method} answered HTTP ${response.status}${reason ? ` (${reason})` : ""}`,
-        );
-      }
-      if (parsed === undefined) {
-        throw new RemoteAdapterRpcError(
-          RpcErrorCode.INTERNAL_ERROR,
-          `chat-adapter-remote: non-JSON response (HTTP ${response.status})`,
-        );
-      }
-      const envelope = JsonRpcResponseSchema.parse(parsed);
-      // Pre-parse rejections answer with `id: null`, so read the error first.
-      if (isErrorResponse(envelope)) throw deserializeError(envelope.error);
-      if (envelope.id !== id) {
-        throw new RemoteAdapterRpcError(
-          RpcErrorCode.INTERNAL_ERROR,
-          "chat-adapter-remote: response id did not match request",
-        );
-      }
-      return decode(envelope.result);
     },
     notify(method, params) {
       const now = Date.now();

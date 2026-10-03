@@ -2,6 +2,7 @@ export {
   AdapterHost,
   createAdapterHost,
   serveAdapter,
+  type HostHealth,
   type ServeAdapterOptions,
 } from "./host/adapter-host";
 export {
@@ -34,4 +35,4 @@ export type {
 } from "./host/delivery";
 export { PROTOCOL_VERSION } from "./rpc/methods";
 export { createReplayGuard, type ReplayGuard } from "./rpc/security";
-export type { HostEvent } from "./types";
+export type { HostEvent, RequestEvent, RequestHandler } from "./types";

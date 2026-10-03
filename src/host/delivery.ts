@@ -13,6 +13,8 @@ export interface ForwardQueue {
   push(entry: QueuedForward): Promise<void>;
   /** Removes and returns what is due, oldest first. */
   takeDue(now: number): Promise<QueuedForward[]>;
+  /** How many are waiting, for health checks. */
+  size?(): Promise<number>;
 }
 
 /** `stopped`: held in memory by a host that stopped, so nothing else will retry it. */
@@ -57,6 +59,9 @@ export function createMemoryForwardQueue(
       const due = entries.filter((entry) => entry.nextAttemptAt <= now);
       for (const entry of due) entries.splice(entries.indexOf(entry), 1);
       return due.sort((a, b) => a.firstAttemptAt - b.firstAttemptAt);
+    },
+    async size() {
+      return entries.length;
     },
   };
 }

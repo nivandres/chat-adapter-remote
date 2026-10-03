@@ -54,7 +54,7 @@ import {
 } from "./rpc/methods";
 import { createReplayGuard, type ReplayGuard } from "./rpc/security";
 import { HANDSHAKE_HEADER, type Secret } from "./rpc/signing";
-import { createRpcClient, type RpcClient } from "./rpc/transport";
+import { createRpcClient, observe, type RpcClient } from "./rpc/transport";
 import { translateIds, translateParams } from "./thread-ids";
 import type { HostEvent, RemoteAdapterConfig } from "./types";
 
@@ -127,6 +127,7 @@ export class RemoteAdapter<
   private readonly secret: Secret;
   private handshaken = false;
   private hostHandshake?: string;
+  private idempotentCalls = false;
   private hostName?: string;
   private streams = true;
   private handshaking?: Promise<void>;
@@ -153,6 +154,7 @@ export class RemoteAdapter<
       url,
       secret: this.secret,
       timeoutMs: config.timeoutMs,
+      onRequest: config.onRequest,
       fetch: async (input, init) => {
         const response = await doFetch(input, init);
         this.observeHost(response.headers);
@@ -162,7 +164,7 @@ export class RemoteAdapter<
     this.rpc = {
       request: async (method, params) => {
         await this.handshake();
-        const result = await this.link.request(method, this.outward(params));
+        const result = await this.retrying(method, this.outward(params));
         return this.inward(method, result);
       },
       notify: (method, params) => this.link.notify(method, params),
@@ -208,12 +210,28 @@ export class RemoteAdapter<
     this.lockScope = handshake.lockScope;
     this.persistThreadHistory = handshake.persistThreadHistory;
     this.supportsTurnCancellation = handshake.supportsTurnCancellation;
+    this.idempotentCalls = handshake.idempotentCalls === true;
     this.applyCapabilities(handshake.capabilities);
     this.applyCustomMethods(handshake.customMethods);
     this.handshaken = true;
   }
 
   /** Chat checks `adapter.x?.()`, so what the host did not report is removed. */
+  /** Every try carries the first one's id, so the host answers a retry instead of running the call twice. */
+  private async retrying(method: string, params: unknown): Promise<unknown> {
+    const { maxAttempts = 3, intervalMs = 1_000 } = this.config.retry || {};
+    const attempts =
+      this.idempotentCalls && this.config.retry !== false ? maxAttempts : 1;
+    const id = crypto.randomUUID();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.link.request(method, params, id);
+      } catch (error) {
+        if (attempt >= attempts || !isTransient(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+    }
+  }
   /** A host reloaded with other capabilities, names or adapter: the next call handshakes again. */
   private observeHost(headers: Headers): void {
     const fingerprint = headers.get(HANDSHAKE_HEADER);
@@ -823,14 +841,23 @@ export class RemoteAdapter<
       );
     }
 
+    const started = Date.now();
     try {
       const answer = await this.deliver(chat, call.data, options);
+      observe(this.config.onRequest, "received", call.data.method, started);
       return Response.json({
         jsonrpc: "2.0",
         id: call.data.id,
         result: (await encode(answer)) ?? null,
       });
     } catch (error) {
+      observe(
+        this.config.onRequest,
+        "received",
+        call.data.method,
+        started,
+        error,
+      );
       // A refusal of ours is an answer; a 5xx tells the host it may send again.
       const wireError = serializeError(error);
       return Response.json(
