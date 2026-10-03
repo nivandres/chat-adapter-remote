@@ -243,6 +243,89 @@ describe("transport", () => {
       mismatched.notify("log", ["info", "", "hi", []]),
     ).not.toThrow();
   });
+
+  it("stops notifying an unreachable side, probes once a pause runs out, and reports what it skipped", async () => {
+    vi.useFakeTimers();
+    try {
+      const reachable = { value: false };
+      const fetch = vi.fn(async () => {
+        if (!reachable.value) throw new TypeError("Unable to connect");
+        return new Response(null, { status: 204 });
+      });
+      const onSkipped = vi.fn();
+      const client = createRpcClient({
+        url: "https://consumer.test/inbound",
+        secret: "s",
+        fetch,
+        onSkipped,
+      });
+      const flood = async (lines: number) => {
+        for (let line = 0; line < lines; line++) client.notify("log", []);
+        await vi.advanceTimersByTimeAsync(0);
+      };
+
+      await flood(1);
+      await flood(1000);
+      expect(fetch).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flood(1000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+
+      reachable.value = true;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flood(1);
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(onSkipped).toHaveBeenCalledWith(1999);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("treats a server error as unreachable, and any answered request as a way back", async () => {
+    const status = { value: 502 };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) =>
+      status.value >= 500
+        ? new Response("Bad Gateway", { status: status.value })
+        : Response.json({
+            jsonrpc: "2.0",
+            id: JSON.parse(String(init?.body)).id,
+            result: null,
+          }),
+    );
+    const onSkipped = vi.fn();
+    const client = createRpcClient({
+      url: "https://consumer.test/inbound",
+      secret: "s",
+      fetch,
+      onSkipped,
+    });
+
+    client.notify("log", []);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    client.notify("log", []);
+    status.value = 200;
+    await client.request("processMessage", []);
+
+    expect(onSkipped).toHaveBeenCalledWith(1);
+    client.notify("log", []);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("caps notifications awaiting an answer, so a slow side is not buried", async () => {
+    const fetch = vi.fn(() => new Promise<Response>(() => {}));
+    const client = createRpcClient({
+      url: "https://consumer.test/inbound",
+      secret: "s",
+      fetch,
+    });
+
+    for (let line = 0; line < 100; line++) client.notify("log", []);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(fetch).toHaveBeenCalledTimes(16);
+  });
 });
 
 describe("host bookkeeping", () => {
@@ -289,5 +372,27 @@ describe("host bookkeeping", () => {
     logger.child("baileys").debug("noise");
 
     expect(sent).toEqual(["reconnecting"]);
+  });
+
+  it("keeps info lines on the host by default", async () => {
+    const { createBridgingLogger } = await import("../host/logger-bridge");
+    const sent: string[] = [];
+    const local = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      child: vi.fn(),
+    };
+    const logger = createBridgingLogger({
+      localLogger: local as never,
+      notify: (_level, _prefix, text) => sent.push(text),
+    });
+
+    logger.info("Connection closed (code=500, reconnect=true)");
+    logger.warn("Logged out");
+
+    expect(local.info).toHaveBeenCalled();
+    expect(sent).toEqual(["Logged out"]);
   });
 });
