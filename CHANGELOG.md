@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.6
+
+Found driving a real adapter end to end through the bridge. Compatible with 0.8 on either side.
+
+### Fixed
+
+- File data sent as an `ArrayBuffer` or `Blob` was destroyed whenever the consumer was registered under another name than the host's adapter, which is the usual setup.
+- A thread's messages could reach the consumer out of order: one whose media took longer to read was overtaken by the next. They now arrive in the order they came in.
+- A thread opened with `openDM` reported `isDM` false until a message arrived in it.
+- Forwards waiting for a consumer that was down kept their inline media, so a full queue could hold gigabytes. Bytes the adapter can fetch again are no longer kept.
+- The attachments of a quoted message could not be fetched on the consumer.
+
 ## 0.8.5
 
 Hardening from a security audit and a live run against WhatsApp. Compatible with 0.8 on either side.
