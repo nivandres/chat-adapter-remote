@@ -74,7 +74,7 @@ process.on("SIGTERM", () => host.stop());
 
 `start()` is idempotent; `ready` is shorthand for it. `stop()` disconnects the adapter, drops open streams, and refuses further dispatch. `onError` covers the `initialize`, `forward`, `dispatch`, `shutdown` and `adapter` phases.
 
-A `GET` on the host's route answers `{ status, openStreams, queuedForwards }`, 200 once the adapter is ready and 503 otherwise, for health probes; it is unsigned and tells nothing else. `onRequest`, on either side, receives every request with its direction, method, duration and error, for metrics.
+A `GET` on the host's route answers `{ status, openStreams, queuedForwards }`, 200 once the adapter is ready and 503 otherwise, for health probes; it is unsigned and tells nothing else. Give the host `healthy: () => …` to fold in the adapter's own connection — for wwebjs, `() => adapter.connection === "connected"` — and a dead session answers 503 with `adapter: "down"`. `onRequest`, on either side, receives every request with its direction, method, duration and error, for metrics.
 
 `host.emit({ type: "qr", code })` reaches the consumer's `onEvent`, for showing a pairing QR or connection state in your own UI.
 
@@ -125,7 +125,7 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 
 ## Security
 
-- Every request in both directions is HMAC-SHA256 signed over a timestamp, a nonce and the raw body, and compared in constant time. Responses are not signed, so serve both ends over HTTPS.
+- Every request in both directions is HMAC-SHA256 signed over a timestamp, a nonce and the raw body, and compared in constant time. Responses are not signed, so serve both ends over HTTPS — or set `encrypt: true` on both: every body is sealed with AES-256-GCM under a key derived from the secret, and each answer is bound to its request, so even plain HTTP reveals and alters nothing.
 - Signatures are single-use inside a tolerance window. The default replay store is per-process; pass a `replayGuard` — `seen()` may be async — to share one across instances.
 - An unsigned or stale request is refused before its body is read, and a body past `maxBodyBytes` (32 MiB by default) is never buffered. Raise it to send larger files inline.
 - Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.7
+
+Compatible with 0.8 on either side.
+
+### Added
+
+- `encrypt: true`, on both sides, seals every request and answer with AES-256-GCM under a key derived from the shared secret, each answer bound to its request. Plain HTTP — a Docker network, a proxy without TLS — then reveals and alters nothing. A side that encrypts alone is told so.
+- `healthy` on the host folds the adapter's own connection into `/health`, which answers 503 with `adapter: "down"` while it is lost.
+
 ## 0.8.6
 
 Found driving a real adapter end to end through the bridge. Compatible with 0.8 on either side.
