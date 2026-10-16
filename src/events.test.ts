@@ -470,6 +470,31 @@ describe("events that carry an answer back", () => {
     expect(await joined.promise).toBe("u9");
   });
 
+  it.each(["processInstalled", "processUninstalled"] as const)(
+    "delivers %s to Chat",
+    async (method) => {
+      const b = bridge();
+      await handshake(b);
+      const delivered = deferred<unknown>();
+      vi.spyOn(b.chat, method).mockImplementation(
+        ((event: unknown) => void delivered.resolve(event)) as never,
+      );
+
+      b.hostChat()[method]!({
+        action: method === "processInstalled" ? "add" : "remove",
+        adapter: b.adapter,
+        conversationId: "c1",
+        id: "i1",
+        raw: {},
+      } as never);
+
+      expect(await delivered.promise).toMatchObject({
+        conversationId: "c1",
+        id: "i1",
+      });
+    },
+  );
+
   it.each([
     "processModalClose",
     "processAppHomeOpened",

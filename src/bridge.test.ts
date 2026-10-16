@@ -290,6 +290,13 @@ describe("handshake", () => {
     }
   });
 
+  it("carries the adapter's concurrency scope, which Chat reads synchronously", async () => {
+    const b = bridge({ getConcurrencyScope: () => "workspace-1" } as never);
+    await handshake(b);
+
+    expect(b.remote.getConcurrencyScope()).toBe("workspace-1");
+  });
+
   it("refuses a host speaking a different protocol version", async () => {
     const remote = createRemoteAdapter({
       url: HOST_URL,
