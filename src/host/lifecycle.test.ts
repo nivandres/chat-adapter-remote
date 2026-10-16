@@ -201,6 +201,39 @@ describe("health", () => {
     });
   });
 
+  it("answers 503 while the adapter's own connection is down", async () => {
+    const connection = { up: true };
+    const host = createAdapterHost(createMockAdapter("mock"), {
+      ...options,
+      healthy: () => connection.up,
+    });
+    await host.start();
+    expect(await probe(host.fetch)).toMatchObject({
+      status: 200,
+      body: { status: "ready", adapter: "up" },
+    });
+
+    connection.up = false;
+    expect(await probe(host.fetch)).toMatchObject({
+      status: 503,
+      body: { status: "ready", adapter: "down" },
+    });
+  });
+
+  it("counts a check that throws as down", async () => {
+    const host = createAdapterHost(createMockAdapter("mock"), {
+      ...options,
+      healthy: () => {
+        throw new Error("browser gone");
+      },
+    });
+    await host.start();
+    expect(await probe(host.fetch)).toMatchObject({
+      status: 503,
+      body: { adapter: "down" },
+    });
+  });
+
   it("counts the forwards waiting for the consumer", async () => {
     let chat!: ChatInstance;
     const adapter = createMockAdapter("mock", {
