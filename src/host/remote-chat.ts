@@ -103,6 +103,17 @@ function isStateRefused(error: unknown): boolean {
   );
 }
 
+function withoutRefetchableBytes(param: unknown): unknown {
+  const attachments = (param as { attachments?: unknown })?.attachments;
+  if (!Array.isArray(attachments)) return param;
+  return {
+    ...(param as object),
+    attachments: attachments.map(({ data, ...rest }) =>
+      rest.fetchMetadata ? rest : { ...rest, data },
+    ),
+  };
+}
+
 const LOCAL_EVENT_KEYS = ["adapter", "thread", "channel"] as const;
 
 class RemoteChat {
@@ -112,6 +123,7 @@ class RemoteChat {
   private state?: StateAdapter;
   private localState?: StateStore;
   private readonly limit: <T>(task: () => Promise<T>) => Promise<T>;
+  private readonly arrivals = new Map<string, Promise<void>>();
 
   constructor(private readonly options: RemoteChatOptions) {
     this.logger =
@@ -161,7 +173,14 @@ class RemoteChat {
         error,
       });
       const wire = (await encode(params)) as unknown[];
-      await this.options.redeliver(forwardEntry(method, wire, threadId));
+      const refetchable = this.options.attachments?.().rehydratable;
+      await this.options.redeliver(
+        forwardEntry(
+          method,
+          refetchable ? wire.map(withoutRefetchableBytes) : wire,
+          threadId,
+        ),
+      );
       return;
     }
     this.logger.error(`failed to deliver ${method} to consumer`, {
@@ -248,6 +267,10 @@ class RemoteChat {
     message: Message | (() => Promise<Message>),
     _options?: WebhookOptions,
   ): Promise<void> {
+    const previous = this.arrivals.get(threadId);
+    let release!: () => void;
+    const slot = new Promise<void>((resolve) => (release = resolve));
+    this.arrivals.set(threadId, slot);
     try {
       const resolved = (await this.resolveMessage(message))!;
       const wire = await serializeMessage(
@@ -259,6 +282,7 @@ class RemoteChat {
             { attachment, error },
           ),
       );
+      await previous;
       await this.forward(
         "processMessage",
         [
@@ -278,6 +302,9 @@ class RemoteChat {
         error,
       });
       this.options.onError?.(error, { phase: "forward", threadId });
+    } finally {
+      release();
+      if (this.arrivals.get(threadId) === slot) this.arrivals.delete(threadId);
     }
   }
 

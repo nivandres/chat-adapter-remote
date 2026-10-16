@@ -582,7 +582,12 @@ export class RemoteAdapter<
   }
 
   async openDM(userId: string): Promise<string> {
-    return (await this.rpc.request("openDM", [userId])) as string;
+    const threadId = (await this.rpc.request("openDM", [userId])) as string;
+    this.rememberThread(threadId, {
+      channelId: this.channelIdFromThreadId(threadId),
+      isDM: true,
+    });
+    return threadId;
   }
 
   async openModal(

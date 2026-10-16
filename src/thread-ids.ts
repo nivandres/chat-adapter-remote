@@ -10,7 +10,9 @@ function walk(value: unknown, from: string, to: string): unknown {
   if (
     value === null ||
     typeof value !== "object" ||
-    Buffer.isBuffer(value) ||
+    ArrayBuffer.isView(value) ||
+    value instanceof ArrayBuffer ||
+    value instanceof Blob ||
     value instanceof Date
   ) {
     return value;

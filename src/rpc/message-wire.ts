@@ -101,6 +101,9 @@ export function deserializeMessage(
     attachments: WireAttachment[];
   };
   const message = MessageClass.fromJSON(decoded);
+  if (decoded.replyTo) {
+    message.replyTo = deserializeMessage(decoded.replyTo, resolve);
+  }
 
   message.attachments = message.attachments.map((attachment, index) => {
     const wired = decoded.attachments?.[index];
