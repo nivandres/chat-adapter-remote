@@ -11,11 +11,13 @@ import {
   verify,
 } from "./signing";
 
+const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
+
 export interface DispatchOptions {
   secret: Secret;
   /** Rejects requests whose signed timestamp is older than this. Default 30s. */
   timestampToleranceMs?: number;
-  /** Rejects bodies larger than this. Unlimited by default: both ends are trusted. */
+  /** Rejects bodies larger than this, read before the signature can be checked. Default 32 MiB. */
   maxBodyBytes?: number;
   /** Rejects a signature that was already accepted inside the freshness window. */
   replayGuard?: ReplayGuard;
@@ -71,39 +73,18 @@ export async function verifyRequest(
   request: Request,
   options: DispatchOptions,
 ): Promise<VerifiedRequest> {
-  const rawBody = await readBody(
-    request,
-    options.maxBodyBytes ?? Number.POSITIVE_INFINITY,
-  );
-  if (rawBody === null) {
-    return {
-      ok: false,
-      response: errorResponse(413, {
-        code: RpcErrorCode.INVALID_REQUEST,
-        message: "Payload too large",
-      }),
-    };
-  }
-
+  const unauthorized = (): VerifiedRequest => ({
+    ok: false,
+    response: errorResponse(401, {
+      code: RpcErrorCode.UNAUTHORIZED,
+      message: "Invalid signature",
+    }),
+  });
   const signature = request.headers.get(SIGNATURE_HEADER);
   const timestamp = request.headers.get(TIMESTAMP_HEADER);
   const nonce = request.headers.get(NONCE_HEADER);
-  if (
-    !signature ||
-    !timestamp ||
-    !nonce ||
-    !secretsOf(options.secret).some((secret) =>
-      verify(rawBody, timestamp, nonce, signature, secret),
-    )
-  ) {
-    return {
-      ok: false,
-      response: errorResponse(401, {
-        code: RpcErrorCode.UNAUTHORIZED,
-        message: "Invalid signature",
-      }),
-    };
-  }
+  // Checked before the body is read, so an unsigned request costs nothing.
+  if (!signature || !timestamp || !nonce) return unauthorized();
   const toleranceMs = options.timestampToleranceMs ?? 30_000;
   if (!isTimestampFresh(timestamp, toleranceMs)) {
     return {
@@ -114,7 +95,28 @@ export async function verifyRequest(
       }),
     };
   }
-  if (await options.replayGuard?.seen(signature, toleranceMs)) {
+  const rawBody = await readBody(
+    request,
+    options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
+  );
+  if (rawBody === null) {
+    return {
+      ok: false,
+      response: errorResponse(413, {
+        code: RpcErrorCode.INVALID_REQUEST,
+        message: "Payload too large",
+      }),
+    };
+  }
+  if (
+    !secretsOf(options.secret).some((secret) =>
+      verify(rawBody, timestamp, nonce, signature, secret),
+    )
+  ) {
+    return unauthorized();
+  }
+  // A timestamp may run up to the tolerance ahead, so it stays fresh for twice as long.
+  if (await options.replayGuard?.seen(signature, 2 * toleranceMs)) {
     return {
       ok: false,
       response: errorResponse(401, {

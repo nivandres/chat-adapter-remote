@@ -1,7 +1,8 @@
-import type { Adapter, WebhookOptions } from "chat";
+import { ConsoleLogger, type Adapter, type WebhookOptions } from "chat";
 
 import { RpcErrorCode } from "../rpc/errors";
 import { AdapterHost, type ServeAdapterOptions } from "./adapter-host";
+import { guardUnhandledRejections } from "./process-guard";
 
 export interface HostedAdapter extends ServeAdapterOptions {
   adapter: Adapter;
@@ -21,8 +22,13 @@ function notFound(name: string): Response {
   );
 }
 
+/** A rejection belongs to no host, so the container guards the process once instead of each host reporting it. */
 function hostFor({ adapter, ...options }: HostedAdapter): AdapterHost {
-  return new AdapterHost(adapter, { ...options, autoStart: false });
+  return new AdapterHost(adapter, {
+    ...options,
+    autoStart: false,
+    catchUnhandledRejections: false,
+  });
 }
 
 function nameOf(request: Request): string {
@@ -33,6 +39,7 @@ function nameOf(request: Request): string {
 export class AdapterHosts {
   private readonly entries = new Map<string, AdapterHost>();
   private readonly pending = new Map<string, Promise<unknown>>();
+  private unguard?: () => void;
 
   readonly fetch = async (request: Request): Promise<Response> => {
     const name = nameOf(request);
@@ -44,6 +51,7 @@ export class AdapterHosts {
     for (const [name, entry] of Object.entries(entries)) {
       this.entries.set(name, hostFor(entry));
     }
+    if (this.entries.size > 0) this.guard();
   }
 
   get hosts(): Readonly<Record<string, AdapterHost>> {
@@ -56,18 +64,7 @@ export class AdapterHosts {
 
   /** Serves `name`, replacing and stopping whatever served it before. */
   add(name: string, entry: HostedAdapter): Promise<AdapterHost> {
-    return this.serialize(name, async () => {
-      await this.stopHost(name);
-      const host = hostFor(entry);
-      this.entries.set(name, host);
-      try {
-        await host.start();
-      } catch (error) {
-        await this.stopHost(name);
-        throw error;
-      }
-      return host;
-    });
+    return this.serialize(name, () => this.replace(name, entry));
   }
 
   remove(name: string): Promise<void> {
@@ -85,6 +82,8 @@ export class AdapterHosts {
     await Promise.allSettled(
       [...this.entries.keys()].map((name) => this.remove(name)),
     );
+    this.unguard?.();
+    this.unguard = undefined;
   }
 
   async handleWebhook(
@@ -102,15 +101,47 @@ export class AdapterHosts {
     return this.get(name);
   }
 
-  private async stopHost(name: string): Promise<void> {
+  /** Unserialized: callers hold the name's turn. */
+  protected async replace(
+    name: string,
+    entry: HostedAdapter,
+  ): Promise<AdapterHost> {
+    await this.stopHost(name);
+    const host = hostFor(entry);
+    this.entries.set(name, host);
+    this.guard();
+    try {
+      await host.start();
+    } catch (error) {
+      await this.stopHost(name);
+      throw error;
+    }
+    return host;
+  }
+
+  /** Reached by a rejection from any served adapter's own event loop. */
+  protected reportRejection(error: unknown): void {
+    new ConsoleLogger("info", "chat-adapter-remote").error(
+      "unhandled rejection inside a served adapter",
+      { error },
+    );
+  }
+
+  protected async stopHost(name: string): Promise<void> {
     const host = this.entries.get(name);
     if (!host) return;
     this.entries.delete(name);
     await host.stop();
   }
 
+  private guard(): void {
+    this.unguard ??= guardUnhandledRejections((error) =>
+      this.reportRejection(error),
+    );
+  }
+
   /** One change per name at a time, so two concurrent adds cannot leave an orphaned host running. */
-  private serialize<T>(name: string, change: () => Promise<T>): Promise<T> {
+  protected serialize<T>(name: string, change: () => Promise<T>): Promise<T> {
     const run = (this.pending.get(name) ?? Promise.resolve())
       .catch(() => undefined)
       .then(change);

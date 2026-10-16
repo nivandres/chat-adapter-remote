@@ -5,6 +5,7 @@ import {
   RemoteAdapterRpcError,
   RpcErrorCode,
   deserializeError,
+  isTransient,
 } from "./errors";
 import {
   NONCE_HEADER,
@@ -193,7 +194,8 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       void send(method, params)
         .then(
           (response) => response.status < 500,
-          () => false,
+          // Only a failure to reach the far side pauses the rest; a line that cannot be encoded is just dropped.
+          (error: unknown) => !isTransient(error),
         )
         .then((arrived) => {
           inFlight--;

@@ -43,7 +43,7 @@ import {
   type StreamEnding,
 } from "../rpc/methods";
 import { createReplayGuard } from "../rpc/security";
-import { HANDSHAKE_HEADER, type Secret } from "../rpc/signing";
+import { HANDSHAKE_HEADER, secretsOf, type Secret } from "../rpc/signing";
 import type { FetchLike, HostEvent, RequestHandler } from "../types";
 import { CallLedger } from "./call-ledger";
 import type { LogLevel } from "./logger-bridge";
@@ -118,7 +118,8 @@ function requireOption<T extends Secret>(
   value: T | undefined,
   option: string,
 ): T {
-  if (!value?.length) {
+  // An empty entry in a rotation list would let anyone sign.
+  if (!value?.length || !secretsOf(value).every(Boolean)) {
     const variable = option === "secret" ? "SECRET" : "CONSUMER_URL";
     throw new ValidationError(
       "remote",
@@ -544,8 +545,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
           (params[1] ?? undefined) as string | undefined,
           (params[2] ?? undefined) as Parameters<typeof adapter.startTyping>[2],
         );
+      // Consumers before 0.8.5 still send it on shutdown; the connection is the host's to close.
       case "disconnect":
-        return this.required("disconnect")();
+        return;
       case "reply":
         return this.required("reply")(
           first,

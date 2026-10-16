@@ -37,11 +37,18 @@ export class AdapterTenants extends AdapterHosts {
     );
   }
 
-  /** Serves a tenant from its record, replacing a running one; a missing record removes it. */
-  async load(id: string): Promise<void> {
-    const entry = await this.source.load(id);
-    if (entry) await this.add(id, entry);
-    else await this.remove(id);
+  /** Serves a tenant from its record, replacing a running one; a missing record removes it. One load per tenant at a time, so a slow read cannot undo a later one. */
+  load(id: string): Promise<void> {
+    return this.serialize(id, async () => {
+      const entry = await this.source.load(id);
+      if (entry) await this.replace(id, entry);
+      else await this.stopHost(id);
+    });
+  }
+
+  protected override reportRejection(error: unknown): void {
+    if (this.source.onError) this.source.onError(error);
+    else super.reportRejection(error);
   }
 }
 

@@ -53,7 +53,7 @@ import {
   type StateOperation,
 } from "./rpc/methods";
 import { createReplayGuard, type ReplayGuard } from "./rpc/security";
-import { HANDSHAKE_HEADER, type Secret } from "./rpc/signing";
+import { HANDSHAKE_HEADER, secretsOf, type Secret } from "./rpc/signing";
 import { createRpcClient, observe, type RpcClient } from "./rpc/transport";
 import { translateIds, translateParams } from "./thread-ids";
 import type { HostEvent, RemoteAdapterConfig } from "./types";
@@ -83,7 +83,8 @@ function requireOption<T extends Secret>(
   value: T | undefined,
   option: string,
 ): T {
-  if (!value?.length) {
+  // An empty entry in a rotation list would let anyone sign.
+  if (!value?.length || !secretsOf(value).every(Boolean)) {
     const variable = option === "url" ? "URL" : "SECRET";
     throw new ValidationError(
       "remote",
@@ -166,7 +167,7 @@ export class RemoteAdapter<
       request: async (method, params) => {
         await this.handshake();
         const result = await this.retrying(method, this.outward(params));
-        return this.inward(method, result);
+        return this.inward(result);
       },
       notify: (method, params) => this.link.notify(method, params),
     };
@@ -252,12 +253,22 @@ export class RemoteAdapter<
     }
   }
 
-  /** Never replaces an existing member, so the host cannot redefine the interface. */
+  /**
+   * Never replaces an existing member, so the host cannot redefine the interface.
+   * A string argument under this adapter's prefix is a thread or channel id, as it is for interface methods.
+   */
   private applyCustomMethods(names?: string[]): void {
     for (const name of names ?? []) {
       if (name in this) continue;
       Reflect.set(this, name, (...args: unknown[]) =>
-        this.rpc.request("custom", [name, args]),
+        this.rpc.request("custom", [
+          name,
+          args.map((arg) =>
+            typeof arg === "string" && this.hostName
+              ? translateParams([arg], this.name, this.hostName)[0]
+              : arg,
+          ),
+        ]),
       );
     }
   }
@@ -282,9 +293,10 @@ export class RemoteAdapter<
     return translateParams(params, this.name, this.hostName);
   }
 
-  private inward(method: string, result: unknown): unknown {
+  /** A bare string answer under the host's prefix is an id, as `openDM` returns. */
+  private inward(result: unknown): unknown {
     if (!this.hostName) return result;
-    if (method === "openDM" && typeof result === "string") {
+    if (typeof result === "string") {
       return translateParams([result], this.hostName, this.name)[0];
     }
     return translateIds(result, this.hostName, this.name);
@@ -757,9 +769,8 @@ export class RemoteAdapter<
     };
   }
 
-  async disconnect(): Promise<void> {
-    await this.rpc.request("disconnect", []);
-  }
+  /** The platform connection is the host's: one consumer shutting down leaves it open for the rest. */
+  async disconnect(): Promise<void> {}
 
   async handleWebhook(
     request: Request,
