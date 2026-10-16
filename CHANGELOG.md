@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.4
+
+Keeps up with Chat SDK 4.42. Compatible with 0.8 on either side.
+
+### Added
+
+- `processInstalled` and `processUninstalled` reach the consumer's `onInstalled` and `onUninstalled`.
+- `getConcurrencyScope()` answers with the host adapter's scope, learned in the handshake.
+
 ## 0.8.3
 
 Compatible with 0.8 on either side; retries take effect once both sides run 0.8.3.

@@ -86,7 +86,7 @@ For one adapter per tenant record, `serveTenants({ list, load })` serves the ids
 
 **Outbound** is the whole `Adapter` interface except four synchronous members — `encodeThreadId`, `decodeThreadId`, `renderFormatted`, `parseMessage` — which cannot be answered over a round trip. They throw if you call them.
 
-**Inbound** is every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modals, options load, agent-session, assistant and app-home events, and turn cancellation. `getState`, `history` and `transcripts` are not bridged and resolve to a logged no-op.
+**Inbound** is every event whose payload is plain data: messages, reactions, edits, deletes, button clicks, slash commands, modals, options load, agent-session, assistant, app-home and installation events, and turn cancellation. `getState`, `history` and `transcripts` are not bridged and resolve to a logged no-op.
 
 Adapters that persist their own data call `chat.getState()`. That reaches the consumer's store, limited by the consumer's `hostState`: `"scoped"` (default) lends keyed values and lists under a prefix of its own, `"full"` the whole store, `"off"` nothing. Pass `state` to the host to give it a store of its own instead.
 
