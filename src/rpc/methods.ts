@@ -61,6 +61,7 @@ export const HandshakeSchema = z
     userName: z.string(),
     botUserId: z.string().optional(),
     lockScope: z.enum(["thread", "channel"]).optional(),
+    concurrencyScope: z.string().optional(),
     persistThreadHistory: z.boolean().optional(),
     supportsTurnCancellation: z.boolean().optional(),
     capabilities: z.array(z.string()).optional(),
@@ -437,6 +438,8 @@ export const INBOUND_CALLS = z.discriminatedUnion("method", [
       "processAssistantThreadStarted",
       "processAssistantContextChanged",
       "processMemberJoinedChannel",
+      "processInstalled",
+      "processUninstalled",
     ] as const
   ).map((method) =>
     z

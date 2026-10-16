@@ -333,6 +333,14 @@ class RemoteChat {
     void this.forwardEvent("processMemberJoinedChannel", event);
   }
 
+  processInstalled(event: EventPayload): void {
+    void this.forwardEvent("processInstalled", event);
+  }
+
+  processUninstalled(event: EventPayload): void {
+    void this.forwardEvent("processUninstalled", event);
+  }
+
   processModalSubmit(
     event: EventPayload,
     contextId?: string,

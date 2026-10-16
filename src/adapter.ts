@@ -116,6 +116,7 @@ export class RemoteAdapter<
   userName: string;
   botUserId?: string;
   lockScope?: LockScope;
+  private concurrencyScope?: string;
   persistThreadHistory?: boolean;
   supportsTurnCancellation?: boolean;
 
@@ -208,6 +209,7 @@ export class RemoteAdapter<
     if (!this.config.userName) this.userName = handshake.userName;
     this.botUserId = handshake.botUserId;
     this.lockScope = handshake.lockScope;
+    this.concurrencyScope = handshake.concurrencyScope;
     this.persistThreadHistory = handshake.persistThreadHistory;
     this.supportsTurnCancellation = handshake.supportsTurnCancellation;
     this.idempotentCalls = handshake.idempotentCalls === true;
@@ -366,6 +368,10 @@ export class RemoteAdapter<
 
   getChannelVisibility(threadId: string): ChannelVisibility {
     return this.threads.get(threadId)?.channelVisibility ?? "unknown";
+  }
+
+  getConcurrencyScope(): string | undefined {
+    return this.concurrencyScope;
   }
 
   encodeThreadId(): never {
@@ -1000,6 +1006,13 @@ export class RemoteAdapter<
       case "processMemberJoinedChannel":
         this.detach(
           chat[call.method](this.event(call.params[0]), options),
+          call.method,
+        );
+        return;
+      case "processInstalled":
+      case "processUninstalled":
+        this.detach(
+          chat[call.method]?.(this.event(call.params[0]), options),
           call.method,
         );
         return;

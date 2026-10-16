@@ -444,6 +444,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       attachments: () => this.attachmentPolicy(),
       botUserId: adapter.botUserId,
       lockScope: adapter.lockScope,
+      concurrencyScope: adapter.getConcurrencyScope?.(),
       persistThreadHistory:
         adapter.persistThreadHistory ?? adapter.persistMessageHistory,
       supportsTurnCancellation: adapter.supportsTurnCancellation,
