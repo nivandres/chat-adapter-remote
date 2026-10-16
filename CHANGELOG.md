@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.5
+
+Hardening from a security audit and a live run against WhatsApp. Compatible with 0.8 on either side.
+
+### Fixed
+
+- Anyone could send an unlimited body, read in full before its signature was checked, and run the process out of memory — every tenant at once under `serveTenants`. An unsigned or stale request is now refused before its body is read, and `maxBodyBytes` defaults to 32 MiB.
+- A consumer shutting down called the host adapter's `disconnect()`, closing the platform connection for every consumer. Neither side does that any more: the connection is the host's.
+- An empty entry in a secret rotation list let anyone sign requests. It is now refused.
+- A slow tenant `load` could finish after a later one and bring back a tenant that had been removed or rotated. Loads for the same tenant now run one at a time.
+- A rejection inside any served adapter reached every tenant's `onError`. `serveAdapters` and `serveTenants` now guard the process once and report it to `serveTenants`' own `onError`.
+- A log line that could not be encoded paused every log line and `host.emit()` event for 30 seconds. It is now dropped on its own.
+- The replay guard forgot a signature while a timestamp signed ahead of the clock was still fresh.
+- A custom method given a thread id by position, rather than in a `threadId` field, reached the host with the consumer's prefix; a bare id answered back kept the host's.
+
 ## 0.8.4
 
 Keeps up with Chat SDK 4.42. Compatible with 0.8 on either side.

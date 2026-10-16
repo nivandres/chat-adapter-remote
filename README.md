@@ -125,11 +125,11 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 
 ## Security
 
-- Every request in both directions is HMAC-SHA256 signed over a timestamp, a nonce and the raw body, and compared in constant time.
+- Every request in both directions is HMAC-SHA256 signed over a timestamp, a nonce and the raw body, and compared in constant time. Responses are not signed, so serve both ends over HTTPS.
 - Signatures are single-use inside a tolerance window. The default replay store is per-process; pass a `replayGuard` — `seen()` may be async — to share one across instances.
-- `maxBodyBytes` bounds how much is read from a request or a response. It is unlimited by default, since both ends are yours; set it if either endpoint is reachable from somewhere you do not control.
+- An unsigned or stale request is refused before its body is read, and a body past `maxBodyBytes` (32 MiB by default) is never buffered. Raise it to send larger files inline.
 - Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
-- One shared secret covers both directions, and a leaked one grants full send-as-the-bot access. To rotate it, give both sides `[old, new]`, then `[new, old]`, then `new`: the first entry signs and any of them verifies.
+- One shared secret covers both directions, and a leaked one grants full send-as-the-bot access. An empty secret, alone or in a list, is refused. To rotate it, give both sides `[old, new]`, then `[new, old]`, then `new`: the first entry signs and any of them verifies.
 
 ## Limits
 
