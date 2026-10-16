@@ -53,7 +53,13 @@ import {
   type StateOperation,
 } from "./rpc/methods";
 import { createReplayGuard, type ReplayGuard } from "./rpc/security";
-import { HANDSHAKE_HEADER, secretsOf, type Secret } from "./rpc/signing";
+import { sealResponse } from "./rpc/sealing";
+import {
+  HANDSHAKE_HEADER,
+  NONCE_HEADER,
+  secretsOf,
+  type Secret,
+} from "./rpc/signing";
 import { createRpcClient, observe, type RpcClient } from "./rpc/transport";
 import { translateIds, translateParams } from "./thread-ids";
 import type { HostEvent, RemoteAdapterConfig } from "./types";
@@ -157,6 +163,7 @@ export class RemoteAdapter<
       secret: this.secret,
       timeoutMs: config.timeoutMs,
       onRequest: config.onRequest,
+      encrypt: config.encrypt,
       fetch: async (input, init) => {
         const response = await doFetch(input, init);
         this.observeHost(response.headers);
@@ -782,15 +789,18 @@ export class RemoteAdapter<
     options?: WebhookOptions,
   ): Promise<Response> {
     // An unhandled rejection here would end the process.
-    try {
-      return await this.receive(request, options);
-    } catch (error) {
-      this.report(error, "handleWebhook");
-      return Response.json(
-        { jsonrpc: "2.0", id: null, error: serializeError(error) },
-        { status: 500 },
-      );
-    }
+    const response = await this.receive(request, options).catch(
+      (error: unknown) => {
+        this.report(error, "handleWebhook");
+        return Response.json(
+          { jsonrpc: "2.0", id: null, error: serializeError(error) },
+          { status: 500 },
+        );
+      },
+    );
+    return this.config.encrypt
+      ? sealResponse(response, this.secret, request.headers.get(NONCE_HEADER))
+      : response;
   }
 
   private async receive(
@@ -802,6 +812,7 @@ export class RemoteAdapter<
       timestampToleranceMs: this.config.timestampToleranceMs,
       maxBodyBytes: this.config.maxBodyBytes,
       replayGuard: this.replayGuard,
+      encrypt: this.config.encrypt,
     });
     if (!verified.ok) return verified.response;
     this.observeHost(request.headers);

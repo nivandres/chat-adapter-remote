@@ -15,6 +15,7 @@ import {
   sign,
   type Secret,
 } from "./signing";
+import { seal, unseal } from "./sealing";
 import type { FetchLike, RequestHandler, RequestEvent } from "../types";
 
 /** How long notifications are skipped after one fails to arrive. */
@@ -33,6 +34,8 @@ export interface RpcClientOptions {
   /** Notifications skipped while the far side was unreachable or backed up, reported once one arrives again. */
   onSkipped?: (count: number) => void;
   onRequest?: RequestHandler;
+  /** Seal bodies both ways; must match the far side's. */
+  encrypt?: boolean;
 }
 
 /** A failing hook must not fail the request it observes. */
@@ -77,15 +80,18 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     method: string,
     params: unknown,
     id?: string,
-  ): Promise<Response> {
-    const body = JSON.stringify({
+  ): Promise<{ response: Response; nonce: string }> {
+    const nonce = crypto.randomUUID();
+    const plain = JSON.stringify({
       jsonrpc: "2.0",
       ...(id === undefined ? {} : { id }),
       method,
       params: await encode(params),
     });
+    const body = options.encrypt
+      ? seal(plain, options.secret, `request.${nonce}`)
+      : plain;
     const timestamp = String(Date.now());
-    const nonce = crypto.randomUUID();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -107,7 +113,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         signal: controller.signal,
       });
       if (response.status < 500) reached();
-      return response;
+      return { response, nonce };
     } catch (error) {
       if (controller.signal.aborted) {
         throw new RemoteAdapterRpcError(
@@ -129,14 +135,18 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     params: unknown,
     id: string,
   ): Promise<unknown> {
-    const response = await send(method, params, id);
-    const text = await readBody(response, maxBodyBytes);
-    if (text === null) {
+    const { response, nonce } = await send(method, params, id);
+    const body = await readBody(response, maxBodyBytes);
+    if (body === null) {
       throw new RemoteAdapterRpcError(
         RpcErrorCode.INVALID_REQUEST,
         `chat-adapter-remote: response larger than ${maxBodyBytes} bytes`,
       );
     }
+    const opened = options.encrypt
+      ? unseal(body, options.secret, `response.${nonce}`)
+      : null;
+    const text = opened ?? body;
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -158,9 +168,24 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         `chat-adapter-remote: non-JSON response (HTTP ${response.status})`,
       );
     }
+    if (parsed && typeof parsed === "object" && "sealed" in parsed) {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.UNAUTHORIZED,
+        options.encrypt
+          ? "chat-adapter-remote: an answer that was not sealed for this call"
+          : "chat-adapter-remote: got an encrypted answer; set encrypt on both sides",
+      );
+    }
     const envelope = JsonRpcResponseSchema.parse(parsed);
     // Pre-parse rejections answer with `id: null`, so read the error first.
     if (isErrorResponse(envelope)) throw deserializeError(envelope.error);
+    // Sealed, a result cannot be forged in transit; unsealed, only an error is believed.
+    if (options.encrypt && opened === null) {
+      throw new RemoteAdapterRpcError(
+        RpcErrorCode.UNAUTHORIZED,
+        "chat-adapter-remote: an encrypted call got an unencrypted answer; set encrypt on both sides",
+      );
+    }
     if (envelope.id !== id) {
       throw new RemoteAdapterRpcError(
         RpcErrorCode.INTERNAL_ERROR,
@@ -193,7 +218,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
       inFlight++;
       void send(method, params)
         .then(
-          (response) => response.status < 500,
+          ({ response }) => response.status < 500,
           // Only a failure to reach the far side pauses the rest; a line that cannot be encoded is just dropped.
           (error: unknown) => !isTransient(error),
         )

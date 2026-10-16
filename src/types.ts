@@ -73,6 +73,8 @@ export interface RemoteAdapterConfig {
   retry?: RetryOptions | false;
   /** Every request sent or received. */
   onRequest?: RequestHandler;
+  /** Seal every body both ways under a key from `secret`, so even plain HTTP reveals and alters nothing. Both sides must agree. */
+  encrypt?: boolean;
   logger?: Logger;
   fetch?: FetchLike;
 }

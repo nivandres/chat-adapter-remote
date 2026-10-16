@@ -48,6 +48,7 @@ export interface RemoteChatOptions {
   secret: Secret;
   headers?: () => Record<string, string>;
   onRequest?: RequestHandler;
+  encrypt?: boolean;
   timeoutMs?: number;
   logger?: Logger;
   fetch?: FetchLike;
@@ -139,6 +140,7 @@ class RemoteChat {
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
       onRequest: options.onRequest,
+      encrypt: options.encrypt,
       onSkipped: (count) =>
         this.getLogger().warn(
           `skipped ${count} log line(s) while the consumer was unreachable or backed up`,

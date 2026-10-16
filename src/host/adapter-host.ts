@@ -43,7 +43,13 @@ import {
   type StreamEnding,
 } from "../rpc/methods";
 import { createReplayGuard } from "../rpc/security";
-import { HANDSHAKE_HEADER, secretsOf, type Secret } from "../rpc/signing";
+import { sealResponse } from "../rpc/sealing";
+import {
+  HANDSHAKE_HEADER,
+  NONCE_HEADER,
+  secretsOf,
+  type Secret,
+} from "../rpc/signing";
 import type { FetchLike, HostEvent, RequestHandler } from "../types";
 import { CallLedger } from "./call-ledger";
 import type { LogLevel } from "./logger-bridge";
@@ -80,6 +86,8 @@ export interface ServeAdapterOptions extends DispatchOptions {
   onError?: HostErrorHandler;
   /** Every request sent or received. */
   onRequest?: RequestHandler;
+  /** Whether the adapter's own connection works; `false` makes `/health` answer 503 with `adapter: "down"`. */
+  healthy?: () => boolean | Promise<boolean>;
   /** Called once the wrapped adapter has initialized. */
   onReady?: () => void;
   /** Lines below this level stay on the host instead of crossing the wire. Default "warn". */
@@ -146,6 +154,8 @@ function failure(
 export interface HostHealth {
   /** `ready` once the adapter has initialized; probes get 503 for anything else. */
   status: "idle" | "starting" | "ready" | "failed" | "stopped";
+  /** What `healthy` answered; absent without one. */
+  adapter?: "up" | "down";
   openStreams: number;
   /** Forwards waiting to be sent again; absent when the queue cannot count. */
   queuedForwards?: number;
@@ -237,6 +247,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
       onRequest: options.onRequest,
+      encrypt: options.encrypt,
       onSkipped: (count) =>
         this.logger.warn(
           `skipped ${count} event(s) while the consumer was unreachable or backed up`,
@@ -262,6 +273,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       secret,
       headers,
       onRequest: options.onRequest,
+      encrypt: options.encrypt,
       timeoutMs: options.timeoutMs,
       logger: this.logger,
       fetch: options.fetch,
@@ -340,10 +352,21 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     const queue = this.redelivery
       ? (this.options.forwardQueue ?? this.memoryQueue)
       : undefined;
+    const status = this.stopped
+      ? "stopped"
+      : (this.outcome ?? (this.starting ? "starting" : "idle"));
+    const healthy = this.options.healthy;
     return {
-      status: this.stopped
-        ? "stopped"
-        : (this.outcome ?? (this.starting ? "starting" : "idle")),
+      status,
+      ...(healthy && status === "ready"
+        ? {
+            adapter: (await Promise.resolve()
+              .then(healthy)
+              .catch(() => false))
+              ? "up"
+              : "down",
+          }
+        : {}),
       openStreams: this.streams.size,
       queuedForwards: await queue?.size?.().catch(() => undefined),
     };
@@ -378,7 +401,13 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       return failure(null, wire.code, wire.message, wire.data);
     });
     response.headers.set(HANDSHAKE_HEADER, this.fingerprint());
-    return response;
+    return this.options.encrypt
+      ? sealResponse(
+          response,
+          this.dispatchOptions.secret,
+          request.headers.get(NONCE_HEADER),
+        )
+      : response;
   }
 
   private async route(request: Request): Promise<Response> {
@@ -459,7 +488,8 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private async probe(): Promise<Response> {
     const health = await this.health();
     return Response.json(health, {
-      status: health.status === "ready" ? 200 : 503,
+      status:
+        health.status === "ready" && health.adapter !== "down" ? 200 : 503,
     });
   }
 

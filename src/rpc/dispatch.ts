@@ -1,5 +1,6 @@
 import { JsonRpcRequestSchema } from "./envelope";
 import { RpcErrorCode, type RpcErrorObject } from "./errors";
+import { unseal } from "./sealing";
 import type { ReplayGuard } from "./security";
 import {
   NONCE_HEADER,
@@ -21,6 +22,8 @@ export interface DispatchOptions {
   maxBodyBytes?: number;
   /** Rejects a signature that was already accepted inside the freshness window. */
   replayGuard?: ReplayGuard;
+  /** Expect sealed bodies, and seal the answers; safe over plain HTTP. Both sides must agree. */
+  encrypt?: boolean;
 }
 
 export type VerifiedRequest =
@@ -126,9 +129,22 @@ export async function verifyRequest(
     };
   }
 
+  const body = options.encrypt
+    ? unseal(rawBody, options.secret, `request.${nonce}`)
+    : rawBody;
+  if (body === null) {
+    return {
+      ok: false,
+      response: errorResponse(400, {
+        code: RpcErrorCode.INVALID_REQUEST,
+        message: "Expected an encrypted body; set encrypt on both sides",
+      }),
+    };
+  }
+
   let json: unknown;
   try {
-    json = JSON.parse(rawBody);
+    json = JSON.parse(body);
   } catch {
     return {
       ok: false,
@@ -145,7 +161,10 @@ export async function verifyRequest(
       ok: false,
       response: errorResponse(400, {
         code: RpcErrorCode.INVALID_REQUEST,
-        message: "Invalid JSON-RPC envelope",
+        message:
+          json && typeof json === "object" && "sealed" in json
+            ? "Got an encrypted body; set encrypt on both sides"
+            : "Invalid JSON-RPC envelope",
       }),
     };
   }
