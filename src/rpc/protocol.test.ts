@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 import { decode, encode } from "./codec";
 import { RpcErrorCode, deserializeError, serializeError } from "./errors";
 import { deserializeMessage, serializeMessage } from "./message-wire";
+import { verifyRequest } from "./dispatch";
 import { createReplayGuard } from "./security";
 import { isTimestampFresh, sign, verify } from "./signing";
 import { createRpcClient } from "./transport";
@@ -54,6 +55,42 @@ describe("signing", () => {
     expect(isTimestampFresh("1000", 30_000, 31_000)).toBe(true);
     expect(isTimestampFresh("1000", 30_000, 31_001)).toBe(false);
     expect(isTimestampFresh("not-a-number", 30_000)).toBe(false);
+  });
+
+  it("remembers a signature for as long as its timestamp stays fresh, even one signed ahead", async () => {
+    vi.useFakeTimers();
+    try {
+      const guard = createReplayGuard();
+      const body = JSON.stringify({
+        jsonrpc: "2.0",
+        id: "1",
+        method: "x",
+        params: [],
+      });
+      const timestamp = String(Date.now() + 20_000);
+      const request = () =>
+        new Request("https://host.test/rpc", {
+          method: "POST",
+          body,
+          headers: {
+            "x-chat-adapter-remote-signature": sign(
+              body,
+              timestamp,
+              "n",
+              "secret",
+            ),
+            "x-chat-adapter-remote-timestamp": timestamp,
+            "x-chat-adapter-remote-nonce": "n",
+          },
+        });
+      const options = { secret: "secret", replayGuard: guard };
+
+      expect((await verifyRequest(request(), options)).ok).toBe(true);
+      vi.advanceTimersByTime(31_000);
+      expect((await verifyRequest(request(), options)).ok).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("accepts a signature once inside its window", async () => {
@@ -311,6 +348,27 @@ describe("transport", () => {
     client.notify("log", []);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("drops a line it cannot encode without silencing the ones after it", async () => {
+    const sent: string[] = [];
+    const client = createRpcClient({
+      url: "https://consumer.test/inbound",
+      secret: "s",
+      fetch: async (_url, init) => {
+        sent.push(JSON.parse(String(init?.body)).method);
+        return new Response(null, { status: 204 });
+      },
+    });
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+
+    client.notify("log", [circular]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    client.notify("hostEvent", [{ type: "qr" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(sent).toEqual(["hostEvent"]);
   });
 
   it("caps notifications awaiting an answer, so a slow side is not buried", async () => {

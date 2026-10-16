@@ -37,6 +37,24 @@ describe("custom adapter methods", () => {
     expect(setPresence).toHaveBeenCalledWith("u1", "composing");
   });
 
+  it("translates a thread id passed by position, as interface methods do", async () => {
+    const muteThread = vi.fn(async (threadId: string) => threadId);
+    const b = bridge(
+      { muteThread } as Partial<Adapter>,
+      { customMethods: ["muteThread"] },
+      { name: "remote" },
+    );
+    await handshake(b);
+
+    const remote = b.remote as unknown as {
+      muteThread(threadId: string): Promise<string>;
+    };
+    expect(await remote.muteThread("remote:general:1")).toBe(
+      "remote:general:1",
+    );
+    expect(muteThread).toHaveBeenCalledWith("mock:general:1");
+  });
+
   it("carries dates through the codec like any other call", async () => {
     const b = bridge(
       {

@@ -267,3 +267,52 @@ describe("rotating the secret", () => {
     expect(adapter.postMessage).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("tenant reloads and the process guard", () => {
+  it("never lets a slow load bring back a tenant a later load removed", async () => {
+    let active = true;
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    let calls = 0;
+    const tenants = serveTenants({
+      list: () => [],
+      load: async () => {
+        const seen = active;
+        if (++calls === 1) await slow;
+        return seen ? entry(createMockAdapter("whatsapp")) : undefined;
+      },
+    });
+    await tenants.start();
+
+    const stale = tenants.load("acme");
+    active = false;
+    const removal = tenants.load("acme");
+    release();
+    await Promise.all([stale, removal]);
+
+    expect(tenants.get("acme")).toBeUndefined();
+  });
+
+  it("reports a rejection from any served adapter once, never to another tenant's onError", async () => {
+    const onError = vi.fn();
+    const tenantErrors = [vi.fn(), vi.fn()];
+    const tenants = serveTenants({
+      list: () => ["a", "b"],
+      load: (id) => ({
+        ...entry(createMockAdapter("whatsapp")),
+        onError: tenantErrors[id === "a" ? 0 : 1],
+      }),
+      onError,
+    });
+    await tenants.start();
+
+    const error = new Error("tenant a's socket blew up");
+    process.emit("unhandledRejection", error, Promise.resolve());
+
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith(error);
+    for (const tenantError of tenantErrors)
+      expect(tenantError).not.toHaveBeenCalled();
+    await tenants.stop();
+  });
+});

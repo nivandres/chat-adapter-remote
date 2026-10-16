@@ -194,7 +194,6 @@ describe("outbound calls", () => {
       ["fetchChannelMessages", ["mock:general"]],
       ["listThreads", ["mock:general"]],
       ["fetchMessage", [THREAD, "m1"]],
-      ["disconnect", []],
     ];
 
     for (const [name, args] of calls) {
@@ -409,11 +408,65 @@ describe("misconfiguration", () => {
     ).toThrow(/"secret" is required/);
   });
 
+  it("never closes the host's platform connection when a consumer shuts down", async () => {
+    const b = bridge();
+    await handshake(b);
+
+    await b.remote.disconnect!();
+    await b.chat.shutdown();
+
+    expect(b.adapter.disconnect).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unsigned request without reading its body", async () => {
+    const b = bridge();
+    await b.host.ready;
+    let pulled = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        pulled++;
+        controller.enqueue(new Uint8Array(1024 * 1024));
+      },
+    });
+
+    const response = await b.host.handleRequest(
+      new Request(HOST_URL, {
+        method: "POST",
+        body,
+        duplex: "half",
+      } as RequestInit),
+    );
+
+    expect(response.status).toBe(401);
+    expect(pulled).toBeLessThanOrEqual(1);
+  });
+
+  it("refuses a rotation list with an empty secret, which anyone could sign with", () => {
+    expect(() =>
+      serveAdapter(createMockAdapter("mock"), {
+        secret: [SECRET, ""],
+        consumerUrl: CONSUMER_URL,
+        autoStart: false,
+      }),
+    ).toThrow(/"secret" is required/);
+    expect(() =>
+      createRemoteAdapter({ url: HOST_URL, secret: ["", SECRET] }),
+    ).toThrow(/"secret" is required/);
+  });
+
   it("answers rather than throwing when verification itself fails", async () => {
     const b = bridge();
     await b.host.ready;
-    // A body that is not a stream and not text, so readBody throws internally.
-    const hostile = new Request(HOST_URL, { method: "POST", body: "{}" });
+    // Signed-looking, so the body is read, and readBody then throws internally.
+    const hostile = new Request(HOST_URL, {
+      method: "POST",
+      body: "{}",
+      headers: {
+        "x-chat-adapter-remote-signature": "sha256=00",
+        "x-chat-adapter-remote-timestamp": String(Date.now()),
+        "x-chat-adapter-remote-nonce": "n",
+      },
+    });
     Object.defineProperty(hostile, "body", {
       get() {
         throw new Error("stream exploded");
