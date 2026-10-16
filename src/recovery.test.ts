@@ -371,6 +371,46 @@ describe("redelivery", () => {
     expect(h.onDropped).not.toHaveBeenCalled();
   });
 
+  it("holds no bytes the adapter can fetch again while the consumer is down", async () => {
+    const queued: unknown[] = [];
+    let chat!: ChatInstance;
+    const adapter = createMockAdapter("mock", {
+      initialize: vi.fn(
+        async (instance: ChatInstance) => void (chat = instance),
+      ),
+      rehydrateAttachment: vi.fn((attachment) => attachment),
+    });
+    const host = serveAdapter(adapter, {
+      secret: SECRET,
+      consumerUrl: CONSUMER_URL,
+      fetch: vi.fn().mockRejectedValue(new TypeError("fetch failed")),
+      forwardQueue: {
+        push: async (entry) => void queued.push(entry),
+        takeDue: async () => [],
+      },
+    });
+    await host.ready;
+
+    await chat.processMessage(
+      adapter,
+      THREAD,
+      message("@mock-bot photo", {
+        attachments: [
+          {
+            type: "image",
+            name: "photo.jpg",
+            size: 1_000_000,
+            fetchData: async () => Buffer.alloc(1_000_000, 1),
+            fetchMetadata: { messageId: "p1" },
+          },
+        ],
+      }),
+    );
+
+    expect(queued).toHaveLength(1);
+    expect(JSON.stringify(queued[0]).length).toBeLessThan(100_000);
+  });
+
   it("keeps entries in a queue of your own", async () => {
     const mode = { value: "down" as "up" | "down" | "slow" | "refuse" };
     const pushed: unknown[] = [];

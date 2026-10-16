@@ -18,7 +18,7 @@ import {
   deferred,
   message,
 } from "./testing/bridge";
-import { translateIds } from "./thread-ids";
+import { translateIds, translateParams } from "./thread-ids";
 import type { FetchLike } from "./types";
 
 /** A host adapter called "whatsapp", registered on the consumer as "remote". */
@@ -127,6 +127,28 @@ describe("thread id prefixes", () => {
       "whatsapp:general:1",
       "whatsapp: is how I reach you",
     );
+  });
+
+  it("keeps binary file data whole while translating", () => {
+    const data = new Uint8Array([1, 2]).buffer;
+    const blob = new Blob(["ab"]);
+    const [, postable] = translateParams(
+      [
+        "remote:T",
+        {
+          markdown: "f",
+          files: [
+            { data, filename: "a.png" },
+            { data: blob, filename: "b.png" },
+          ],
+        },
+      ],
+      "remote",
+      "whatsapp",
+    ) as [string, { files: Array<{ data: unknown }> }];
+
+    expect(postable.files[0]!.data).toBe(data);
+    expect(postable.files[1]!.data).toBe(blob);
   });
 
   it("leaves raw platform data and formatted text alone", () => {

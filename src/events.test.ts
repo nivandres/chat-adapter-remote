@@ -160,6 +160,79 @@ describe("attachments", () => {
     return { b, attach };
   }
 
+  it("keeps a thread's arrival order when the first message waits on its media", async () => {
+    const b = bridge();
+    await handshake(b);
+    const order: string[] = [];
+    const both = deferred<void>();
+    b.chat.onNewMention(async (_thread, received) => {
+      order.push(received.text);
+      if (order.length === 2) both.resolve();
+    });
+    const slow = {
+      type: "image" as const,
+      name: "photo.jpg",
+      size: 3,
+      fetchData: () =>
+        new Promise<Buffer>((resolve) =>
+          setTimeout(resolve, 100, Buffer.from("abc")),
+        ),
+    };
+
+    await Promise.all([
+      b
+        .hostChat()
+        .processMessage(
+          b.adapter,
+          THREAD,
+          message("@mock-bot photo", { attachments: [slow] }),
+        ),
+      b
+        .hostChat()
+        .processMessage(b.adapter, THREAD, message("@mock-bot what is it?")),
+    ]);
+    await both.promise;
+
+    expect(order).toEqual(["@mock-bot photo", "@mock-bot what is it?"]);
+  });
+
+  it("lets the consumer fetch an attachment of the quoted message", async () => {
+    const b = bridge({
+      rehydrateAttachment: vi.fn((attachment: Attachment) => ({
+        ...attachment,
+        fetchData: async () => Buffer.from("abc"),
+      })),
+    });
+    await handshake(b);
+    const delivered = deferred<Message>();
+    b.chat.onNewMention(async (_thread, received) =>
+      delivered.resolve(received),
+    );
+    const quoted = message("quoted", {
+      attachments: [
+        {
+          type: "image",
+          name: "photo.jpg",
+          size: 3,
+          fetchData: async () => Buffer.from("abc"),
+          fetchMetadata: { messageId: "p1" },
+        },
+      ],
+    });
+
+    await b
+      .hostChat()
+      .processMessage(
+        b.adapter,
+        THREAD,
+        message("@mock-bot see above", { replyTo: quoted }),
+      );
+
+    expect(
+      typeof (await delivered.promise).replyTo?.attachments[0]?.fetchData,
+    ).toBe("function");
+  });
+
   it("inlines small media and still exposes fetchData", async () => {
     const { b, attach } = mediaBridge(png.length, png);
     await handshake(b);

@@ -297,6 +297,13 @@ describe("thread facts across instances", () => {
     expect(await shared.getList("remote:mock:threads")).toEqual(["mock:C1:1"]);
   });
 
+  it("knows a thread it opened with openDM is a DM", async () => {
+    const b = bridge({ openDM: vi.fn(async () => "mock:D9:1") });
+    await handshake(b);
+
+    expect(b.remote.isDM(await b.remote.openDM!("u1"))).toBe(true);
+  });
+
   it("falls back to the default for a thread no instance has seen", async () => {
     const b = bridge();
     await handshake(b);
