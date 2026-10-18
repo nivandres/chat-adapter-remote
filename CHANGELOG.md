@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.8
+
+Compatible with 0.8 on either side.
+
+### Added
+
+- `createStateForwardQueue(state)` keeps forwards the consumer did not receive in a Chat SDK state adapter, so they outlive a restart and replicas share them.
+- `journalForwards: true` keeps every forward from before it is sent until the consumer acknowledges it, so a crash loses neither the backlog nor what was in flight.
+- `/health` tells whether the consumer is reachable, how many events were forwarded, failed or given up on, and when the last one arrived.
+
 ## 0.8.7
 
 Compatible with 0.8 on either side.
