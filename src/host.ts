@@ -26,12 +26,14 @@ export type {
   StreamMode,
   StreamModeOptions,
 } from "./host/stream-modes";
-export type {
-  DropReason,
-  DroppedForwardHandler,
-  ForwardQueue,
-  ForwardRetryOptions,
-  QueuedForward,
+export {
+  createStateForwardQueue,
+  type DropReason,
+  type DroppedForwardHandler,
+  type ForwardQueue,
+  type ForwardRetryOptions,
+  type QueuedForward,
+  type StateForwardQueueOptions,
 } from "./host/delivery";
 export { PROTOCOL_VERSION } from "./rpc/methods";
 export { createReplayGuard, type ReplayGuard } from "./rpc/security";

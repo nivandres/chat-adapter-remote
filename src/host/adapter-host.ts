@@ -27,6 +27,7 @@ import {
   RemoteAdapterRpcError,
   RpcErrorCode,
   StreamDiscardedError,
+  isTransient,
   isUndelivered,
   serializeError,
 } from "../rpc/errors";
@@ -50,7 +51,12 @@ import {
   secretsOf,
   type Secret,
 } from "../rpc/signing";
-import type { FetchLike, HostEvent, RequestHandler } from "../types";
+import type {
+  FetchLike,
+  HostEvent,
+  RequestEvent,
+  RequestHandler,
+} from "../types";
 import { CallLedger } from "./call-ledger";
 import type { LogLevel } from "./logger-bridge";
 import { createRemoteChat, type HostErrorHandler } from "./remote-chat";
@@ -116,6 +122,8 @@ export interface ServeAdapterOptions extends DispatchOptions {
   forwardRetry?: ForwardRetryOptions | false;
   /** Where those forwards wait. Default in memory, capped at 1000. */
   forwardQueue?: ForwardQueue;
+  /** Keep every forward in `forwardQueue` until the consumer acknowledges it, so a crash or restart loses none. Needs a queue with `remove`. */
+  journalForwards?: boolean;
   /** Called for a forward that will not be delivered, with why. */
   onDropped?: DroppedForwardHandler;
   /** How replies stream; see `StreamModeOptions`. */
@@ -156,6 +164,12 @@ export interface HostHealth {
   status: "idle" | "starting" | "ready" | "failed" | "stopped";
   /** What `healthy` answered; absent without one. */
   adapter?: "up" | "down";
+  /** Whether the consumer answered the last call; absent before the first. */
+  consumer?: "up" | "down";
+  /** Events forwarded since start: acknowledged, failed attempts, and given up on. */
+  forwards: { sent: number; failed: number; dropped: number };
+  /** When the consumer last acknowledged one, in ms since the epoch. */
+  lastForwardAt?: number;
   openStreams: number;
   /** Forwards waiting to be sent again; absent when the queue cannot count. */
   queuedForwards?: number;
@@ -185,6 +199,9 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
   private outcome?: "ready" | "failed";
   private stopped = false;
   private readonly ledger = new CallLedger();
+  private consumer?: HostHealth["consumer"];
+  private readonly forwards = { sent: 0, failed: 0, dropped: 0 };
+  private lastForwardAt?: number;
 
   constructor(
     private readonly adapter: Adapter<TThreadId, TRawMessage>,
@@ -232,6 +249,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     );
 
     const dropped: DroppedForwardHandler = (entry, reason, error) => {
+      this.forwards.dropped++;
       this.logger.error(
         `dropped ${entry.method} after ${entry.attempts} attempt(s): ${reason}`,
         { threadId: entry.threadId, error },
@@ -240,25 +258,36 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     };
     this.dropped = dropped;
     const headers = () => ({ [HANDSHAKE_HEADER]: this.fingerprint() });
+    const onRequest: RequestHandler = (event) => {
+      this.track(event);
+      options.onRequest?.(event);
+    };
     this.toConsumer = createRpcClient({
       url: consumerUrl,
       secret,
       headers,
       timeoutMs: options.timeoutMs,
       fetch: options.fetch,
-      onRequest: options.onRequest,
+      onRequest,
       encrypt: options.encrypt,
       onSkipped: (count) =>
         this.logger.warn(
           `skipped ${count} event(s) while the consumer was unreachable or backed up`,
         ),
     });
+    if (
+      options.journalForwards &&
+      (options.forwardRetry === false || !options.forwardQueue?.remove)
+    ) {
+      throw new ValidationError(
+        "remote",
+        '"journalForwards" needs "forwardRetry" and a "forwardQueue" with remove(), such as createStateForwardQueue()',
+      );
+    }
     if (options.forwardRetry !== false) {
       this.memoryQueue = options.forwardQueue
         ? undefined
-        : createMemoryForwardQueue((entry) =>
-            dropped(entry, "overflow", undefined),
-          );
+        : createMemoryForwardQueue();
       this.redelivery = new Redelivery({
         queue: options.forwardQueue ?? this.memoryQueue!,
         ...options.forwardRetry,
@@ -272,7 +301,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       consumerUrl,
       secret,
       headers,
-      onRequest: options.onRequest,
+      onRequest,
       encrypt: options.encrypt,
       timeoutMs: options.timeoutMs,
       logger: this.logger,
@@ -284,6 +313,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       redeliver: this.redelivery
         ? (entry) => this.redelivery!.keep(entry)
         : undefined,
+      journal: options.journalForwards ? this.redelivery : undefined,
       dropped,
       logForwardLevel: options.logForwardLevel,
       maxConcurrentForwards: options.maxConcurrentForwards,
@@ -367,9 +397,25 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
               : "down",
           }
         : {}),
+      consumer: this.consumer,
+      forwards: { ...this.forwards },
+      lastForwardAt: this.lastForwardAt,
       openStreams: this.streams.size,
       queuedForwards: await queue?.size?.().catch(() => undefined),
     };
+  }
+
+  /** A call the consumer answered, even with an error, proves it reachable. */
+  private track({ direction, method, error }: RequestEvent): void {
+    if (direction !== "sent") return;
+    this.consumer = isTransient(error) ? "down" : "up";
+    if (method === "state") return;
+    if (error) {
+      this.forwards.failed++;
+      return;
+    }
+    this.forwards.sent++;
+    this.lastForwardAt = Date.now();
   }
 
   /** Reaches the consumer's `onEvent`. Best effort, never retried. */

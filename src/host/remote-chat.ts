@@ -56,6 +56,11 @@ export interface RemoteChatOptions {
   /** Answers `getUserName()`, which cannot be asked of the consumer synchronously. */
   userName?: string;
   redeliver?: (entry: QueuedForward) => Promise<void>;
+  /** Holds each forward from before it is sent until the consumer acknowledges it. */
+  journal?: {
+    hold(entry: QueuedForward): Promise<void>;
+    release(id: string): Promise<void>;
+  };
   dropped?: DroppedForwardHandler;
   attachments?: () => AttachmentPolicy;
   state?: StateAdapter;
@@ -155,11 +160,57 @@ class RemoteChat {
     params: unknown[],
     threadId?: string,
   ): Promise<void> {
+    const kept = await this.keep(method, params, threadId);
     try {
       await this.limit(() => this.rpc.request(method, params));
+      if (kept) await this.release(kept);
     } catch (error) {
-      await this.undelivered(method, params, threadId, error);
+      await this.undelivered(method, params, threadId, error, kept);
     }
+  }
+
+  private async entryFor(
+    method: string,
+    params: unknown[],
+    threadId: string | undefined,
+  ): Promise<QueuedForward> {
+    const wire = (await encode(params)) as unknown[];
+    const refetchable = this.options.attachments?.().rehydratable;
+    return forwardEntry(
+      method,
+      refetchable ? wire.map(withoutRefetchableBytes) : wire,
+      threadId,
+    );
+  }
+
+  /** A store that fails only costs the guarantee, never the forward. */
+  private async keep(
+    method: string,
+    params: unknown[],
+    threadId: string | undefined,
+  ): Promise<QueuedForward | undefined> {
+    const journal = this.options.journal;
+    if (!journal) return undefined;
+    try {
+      const entry = await this.entryFor(method, params, threadId);
+      await journal.hold(entry);
+      return entry;
+    } catch (error) {
+      this.logger.warn(`could not keep ${method} before sending it`, {
+        threadId,
+        error,
+      });
+      return undefined;
+    }
+  }
+
+  private async release(entry: QueuedForward): Promise<void> {
+    await this.options.journal!.release(entry.id).catch((error: unknown) =>
+      this.logger.warn(`could not release ${entry.method} once delivered`, {
+        threadId: entry.threadId,
+        error,
+      }),
+    );
   }
 
   /** A timed-out forward may have been handled, so it is never sent twice. */
@@ -168,23 +219,19 @@ class RemoteChat {
     params: unknown[],
     threadId: string | undefined,
     error: unknown,
+    kept?: QueuedForward,
   ): Promise<void> {
     if (isUndelivered(error) && this.options.redeliver) {
       this.logger.warn(`${method} did not reach the consumer, keeping it`, {
         threadId,
         error,
       });
-      const wire = (await encode(params)) as unknown[];
-      const refetchable = this.options.attachments?.().rehydratable;
       await this.options.redeliver(
-        forwardEntry(
-          method,
-          refetchable ? wire.map(withoutRefetchableBytes) : wire,
-          threadId,
-        ),
+        kept ?? (await this.entryFor(method, params, threadId)),
       );
       return;
     }
+    if (kept) await this.release(kept);
     this.logger.error(`failed to deliver ${method} to consumer`, {
       threadId,
       error,
