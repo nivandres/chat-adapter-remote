@@ -176,7 +176,12 @@ describe("health", () => {
     await host.start();
     expect(await probe(host.fetch)).toEqual({
       status: 200,
-      body: { status: "ready", openStreams: 0, queuedForwards: 0 },
+      body: {
+        status: "ready",
+        forwards: { sent: 0, failed: 0, dropped: 0 },
+        openStreams: 0,
+        queuedForwards: 0,
+      },
     });
 
     await host.stop();
@@ -250,6 +255,42 @@ describe("health", () => {
     await chat.processMessage(adapter, "mock:c:1", message("while down"));
 
     expect(await host.health()).toMatchObject({ queuedForwards: 1 });
+  });
+
+  it("tells whether the consumer is reachable and how forwarding goes", async () => {
+    let chat!: ChatInstance;
+    const adapter = createMockAdapter("mock", {
+      initialize: vi.fn(
+        async (instance: ChatInstance) => void (chat = instance),
+      ),
+    });
+    const consumer = { up: false };
+    const host = serveAdapter(adapter, {
+      ...options,
+      forwardRetry: false,
+      fetch: vi.fn(async (_url: string, init?: RequestInit) => {
+        if (!consumer.up) throw new TypeError("fetch failed");
+        const { id } = JSON.parse(String(init?.body));
+        return Response.json({ jsonrpc: "2.0", id, result: null });
+      }),
+    });
+    await host.ready;
+    expect((await host.health()).consumer).toBeUndefined();
+
+    await chat.processMessage(adapter, "mock:c:1", message("while down"));
+    expect(await host.health()).toMatchObject({
+      consumer: "down",
+      forwards: { sent: 0, failed: 1, dropped: 1 },
+    });
+
+    consumer.up = true;
+    await chat.processMessage(adapter, "mock:c:1", message("back"));
+    const health = await host.health();
+    expect(health).toMatchObject({
+      consumer: "up",
+      forwards: { sent: 1, failed: 1, dropped: 1 },
+    });
+    expect(health.lastForwardAt).toBeLessThanOrEqual(Date.now());
   });
 });
 

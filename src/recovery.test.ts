@@ -1,13 +1,20 @@
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createMockAdapter } from "@chat-adapter/tests";
-import { Chat, type ChatInstance } from "chat";
+import { Chat, type ChatInstance, type StateAdapter } from "chat";
 import { describe, expect, it, vi } from "vitest";
 
 import { createRemoteAdapter } from "./adapter";
-import { serveAdapter } from "./host";
+import { createStateForwardQueue, serveAdapter } from "./host";
 import { CallLedger } from "./host/call-ledger";
+import { forwardEntry } from "./host/delivery";
 import { RpcErrorCode } from "./rpc/errors";
-import { CONSUMER_URL, HOST_URL, SECRET, message } from "./testing/bridge";
+import {
+  CONSUMER_URL,
+  HOST_URL,
+  SECRET,
+  deferred,
+  message,
+} from "./testing/bridge";
 import type { FetchLike, RemoteAdapterConfig } from "./types";
 
 const THREAD = "mock:general:1";
@@ -245,7 +252,7 @@ describe("redelivery", () => {
   it("waits longer between attempts with a backoff, up to its ceiling", async () => {
     const { Redelivery, createMemoryForwardQueue, forwardEntry } =
       await import("./host/delivery");
-    const queue = createMemoryForwardQueue(() => {});
+    const queue = createMemoryForwardQueue();
     const redelivery = new Redelivery({
       queue,
       intervalMs: 1000,
@@ -274,7 +281,7 @@ describe("redelivery", () => {
     const delivered: string[] = [];
     const onDropped = vi.fn();
     const redelivery = new Redelivery({
-      queue: createMemoryForwardQueue(() => {}),
+      queue: createMemoryForwardQueue(),
       intervalMs: 0,
       send: async (_method, params) => {
         const [text] = params as [string];
@@ -298,19 +305,23 @@ describe("redelivery", () => {
   });
 
   it("drops the oldest entry once the memory queue is full", async () => {
-    const { createMemoryForwardQueue, forwardEntry } =
+    const { Redelivery, createMemoryForwardQueue, forwardEntry } =
       await import("./host/delivery");
     const overflowed: unknown[] = [];
-    const queue = createMemoryForwardQueue(
-      (entry) => void overflowed.push(entry.threadId),
-      2,
-    );
+    const queue = createMemoryForwardQueue(2);
+    const redelivery = new Redelivery({
+      queue,
+      send: async () => undefined,
+      isUndelivered: () => true,
+      onDropped: (entry, reason) =>
+        void overflowed.push([entry.threadId, reason]),
+    });
 
     for (const threadId of ["first", "second", "third"]) {
-      await queue.push(forwardEntry("processMessage", [], threadId));
+      await redelivery.keep(forwardEntry("processMessage", [], threadId));
     }
 
-    expect(overflowed).toEqual(["first"]);
+    expect(overflowed).toEqual([["first", "overflow"]]);
     expect(
       (await queue.takeDue(Number.POSITIVE_INFINITY)).map((e) => e.threadId),
     ).toEqual(["second", "third"]);
@@ -323,7 +334,7 @@ describe("redelivery", () => {
         await import("./host/delivery");
       const send = vi.fn(async () => undefined);
       const redelivery = new Redelivery({
-        queue: createMemoryForwardQueue(() => {}),
+        queue: createMemoryForwardQueue(),
         intervalMs: 1000,
         send,
         isUndelivered: () => true,
@@ -428,6 +439,177 @@ describe("redelivery", () => {
     expect(pushed).toHaveLength(1);
     // JSON-safe, so a shared store can hold it.
     expect(() => JSON.stringify(pushed[0])).not.toThrow();
+  });
+});
+
+/** A host whose forwards wait in `state`, which outlives it the way Redis would. */
+async function durableHost(
+  state: StateAdapter,
+  fetch: FetchLike,
+  options: Record<string, unknown> = {},
+) {
+  let chat!: ChatInstance;
+  const adapter = createMockAdapter("mock", {
+    initialize: vi.fn(async (instance: ChatInstance) => void (chat = instance)),
+  });
+  const queue = createStateForwardQueue(state);
+  const onDropped = vi.fn();
+  const host = serveAdapter(adapter, {
+    secret: SECRET,
+    consumerUrl: CONSUMER_URL,
+    fetch,
+    forwardQueue: queue,
+    forwardRetry: { intervalMs: 0 },
+    onDropped,
+    ...options,
+  });
+  await host.ready;
+  const redelivery = Reflect.get(host, "redelivery") as {
+    drain(): Promise<void>;
+  };
+  return { adapter, host, chat: () => chat, queue, onDropped, redelivery };
+}
+
+describe("durable forwards", () => {
+  it("hands what one host kept to the next one sharing its store", async () => {
+    const state = createMemoryState();
+    const down = { value: "down" as "up" | "down" | "slow" | "refuse" };
+    const first = await durableHost(state, consumer(down).fetch);
+    await first.chat().processMessage(first.adapter, THREAD, message("kept"));
+    await first.host.stop();
+    expect(first.onDropped).not.toHaveBeenCalled();
+
+    const up = consumer({ value: "up" });
+    const next = await durableHost(state, up.fetch);
+    await next.redelivery.drain();
+
+    expect(up.received).toEqual(["kept"]);
+    expect(await next.queue.size!()).toBe(0);
+  });
+
+  it("journals a forward until it is acknowledged, so a crash mid-send loses nothing", async () => {
+    const state = createMemoryState();
+    const answer = deferred<Response>();
+    const first = await durableHost(state, () => answer.promise, {
+      journalForwards: true,
+      timeoutMs: 10_000,
+    });
+    void first.chat().processMessage(first.adapter, THREAD, message("mid"));
+    await vi.waitFor(async () => expect(await first.queue.size!()).toBe(1));
+    await first.redelivery.drain();
+    expect(await first.queue.size!()).toBe(1);
+    await first.host.stop();
+
+    const up = consumer({ value: "up" });
+    const next = await durableHost(state, up.fetch);
+    await next.redelivery.drain();
+
+    expect(up.received).toEqual(["mid"]);
+  });
+
+  it("forgets a journaled forward once acknowledged", async () => {
+    const up = consumer({ value: "up" });
+    const h = await durableHost(createMemoryState(), up.fetch, {
+      journalForwards: true,
+    });
+
+    await h.chat().processMessage(h.adapter, THREAD, message("done"));
+
+    expect(up.received).toEqual(["done"]);
+    expect(await h.queue.size!()).toBe(0);
+  });
+
+  it("drops a refused forward once, leaving nothing journaled", async () => {
+    const h = await durableHost(
+      createMemoryState(),
+      consumer({ value: "refuse" }).fetch,
+      { journalForwards: true },
+    );
+
+    await h.chat().processMessage(h.adapter, THREAD, message("bad"));
+
+    expect(h.onDropped).toHaveBeenCalledOnce();
+    expect(h.onDropped).toHaveBeenCalledWith(
+      expect.anything(),
+      "rejected",
+      expect.anything(),
+    );
+    expect(await h.queue.size!()).toBe(0);
+  });
+
+  it("keeps a forward journaled once while the consumer is down", async () => {
+    const h = await durableHost(
+      createMemoryState(),
+      consumer({ value: "down" }).fetch,
+      { journalForwards: true },
+    );
+
+    await h.chat().processMessage(h.adapter, THREAD, message("once"));
+
+    expect(await h.queue.size!()).toBe(1);
+  });
+
+  it("still forwards when the store fails", async () => {
+    const up = consumer({ value: "up" });
+    const { host, chat, adapter } = await hostWith(
+      { value: "up" },
+      {
+        fetch: up.fetch,
+        journalForwards: true,
+        forwardQueue: {
+          push: async () => {
+            throw new Error("redis down");
+          },
+          takeDue: async () => [],
+          remove: async () => {},
+        },
+      },
+    );
+
+    await chat().processMessage(adapter, THREAD, message("anyway"));
+
+    expect(up.received).toEqual(["anyway"]);
+    await host.stop();
+  });
+
+  it("evicts the oldest past its capacity, as overflow", async () => {
+    const queue = createStateForwardQueue(createMemoryState(), {
+      maxEntries: 2,
+    });
+    const evicted: unknown[] = [];
+    for (const threadId of ["first", "second", "third"]) {
+      const out = await queue.push(
+        forwardEntry("processMessage", [], threadId),
+      );
+      evicted.push(...(out ?? []).map((entry) => entry.threadId));
+    }
+
+    expect(evicted).toEqual(["first"]);
+    expect(
+      (await queue.takeDue(Number.POSITIVE_INFINITY)).map((e) => e.threadId),
+    ).toEqual(["second", "third"]);
+  });
+
+  it("keeps hosts sharing a store apart by key", async () => {
+    const state = createMemoryState();
+    const one = createStateForwardQueue(state, { key: "tenant-1" });
+    const two = createStateForwardQueue(state, { key: "tenant-2" });
+
+    await one.push(forwardEntry("processMessage", [], THREAD));
+
+    expect(await two.takeDue(Number.POSITIVE_INFINITY)).toEqual([]);
+    expect(await one.takeDue(Number.POSITIVE_INFINITY)).toHaveLength(1);
+  });
+
+  it("refuses journalForwards without a queue that can forget an entry", () => {
+    expect(() =>
+      serveAdapter(createMockAdapter("mock"), {
+        secret: SECRET,
+        consumerUrl: CONSUMER_URL,
+        fetch: vi.fn(),
+        journalForwards: true,
+      }),
+    ).toThrow(/journalForwards/);
   });
 });
 
