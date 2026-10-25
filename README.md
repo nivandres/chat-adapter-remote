@@ -1,3 +1,5 @@
+[![chat-adapter-remote: run any Chat SDK adapter in its own process](https://raw.githubusercontent.com/nivandres/chat-adapter-remote/main/.github/banner.png)](https://github.com/nivandres/chat-adapter-remote)
+
 # chat-adapter-remote
 
 > npm package: [`chat-adapter-remote`](https://www.npmjs.com/package/chat-adapter-remote)
