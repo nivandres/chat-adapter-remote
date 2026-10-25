@@ -54,6 +54,7 @@ export interface RemoteAdapterConfig {
   name?: string;
   /** Overrides the bot username learned from the handshake. */
   userName?: string;
+  /** How long a call waits for its answer. Default 10 seconds. */
   timeoutMs?: number;
   /** Oldest signed timestamp accepted. Default 30s. */
   timestampToleranceMs?: number;
@@ -75,6 +76,8 @@ export interface RemoteAdapterConfig {
   onRequest?: RequestHandler;
   /** Seal every body both ways under a key from `secret`, so even plain HTTP reveals and alters nothing. Both sides must agree. */
   encrypt?: boolean;
+  /** Where its own lines go. Default a `ConsoleLogger` at "info". */
   logger?: Logger;
+  /** How it reaches the other side. Default the global `fetch`. */
   fetch?: FetchLike;
 }

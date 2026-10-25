@@ -943,7 +943,8 @@ export class RemoteAdapter<
       access === "scoped"
         ? [`adapter:${this.name}:${String(args[0])}`, ...args.slice(1)]
         : args;
-    return store[operation]!(...scoped);
+    // Stored as it crossed, so it is decoded before the answer encodes it again.
+    return store[operation]!(...scoped).then(decode);
   }
 
   private event<T>(payload: Record<string, unknown>): T {
@@ -974,7 +975,12 @@ export class RemoteAdapter<
             ChannelVisibility | undefined,
         });
         this.detach(
-          chat.processMessage(this, threadId, this.rebuild(wire), options),
+          chat.processMessage(
+            this,
+            threadId,
+            this.rebuild(decode(wire)),
+            options,
+          ),
           call.method,
         );
         return;

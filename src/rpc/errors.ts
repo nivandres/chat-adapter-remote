@@ -59,11 +59,29 @@ export class StreamDiscardedError extends RemoteAdapterRpcError {
   }
 }
 
+/** No answer at all, rather than an answer that failed: still `UNAVAILABLE` to callers. */
+export class UnreachableError extends RemoteAdapterRpcError {}
+
 /** Never handled, so safe to send again. A timeout may have been. */
 export function isUndelivered(error: unknown): boolean {
   return (
     error instanceof RemoteAdapterRpcError &&
     error.code === RpcErrorCode.UNAVAILABLE
+  );
+}
+
+/** Nothing answered, so the next call would fail the same way. */
+export function isUnreachable(error: unknown): boolean {
+  return error instanceof UnreachableError;
+}
+
+/** Answered by something that takes nothing from this side: a wrong secret, clock or URL. */
+export function isMisconfigured(error: unknown): boolean {
+  return (
+    error instanceof RemoteAdapterRpcError &&
+    (error.code === RpcErrorCode.UNAUTHORIZED ||
+      error.code === RpcErrorCode.STALE_TIMESTAMP ||
+      error.code === RpcErrorCode.METHOD_NOT_FOUND)
   );
 }
 

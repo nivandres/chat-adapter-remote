@@ -1,5 +1,7 @@
 const BUFFER_TAG = "__charBuffer";
 const DATE_TAG = "__charDate";
+const OBJECT_TAG = "__charObject";
+const TAGS = [BUFFER_TAG, DATE_TAG, OBJECT_TAG];
 
 interface WireBuffer {
   [BUFFER_TAG]: string;
@@ -7,6 +9,10 @@ interface WireBuffer {
 
 interface WireDate {
   [DATE_TAG]: string;
+}
+
+interface WireObject {
+  [OBJECT_TAG]: object;
 }
 
 function isWireBuffer(value: object): value is WireBuffer {
@@ -17,6 +23,10 @@ function isWireDate(value: object): value is WireDate {
   return typeof (value as WireDate)[DATE_TAG] === "string";
 }
 
+function isWireObject(value: object): value is WireObject {
+  return (value as WireObject)[OBJECT_TAG] instanceof Object;
+}
+
 async function toBuffer(value: Buffer | ArrayBuffer | Blob): Promise<Buffer> {
   if (Buffer.isBuffer(value)) return value;
   if (value instanceof ArrayBuffer) return Buffer.from(value);
@@ -24,7 +34,8 @@ async function toBuffer(value: Buffer | ArrayBuffer | Blob): Promise<Buffer> {
 }
 
 /**
- * Replaces Buffer/ArrayBuffer/Blob and Date with JSON-safe wire forms.
+ * Replaces Buffer/ArrayBuffer/Blob and Date with JSON-safe wire forms, and
+ * wraps an object that would pass for one, so it arrives as it was.
  * `ancestors` tracks the current path, not every value seen, so a value
  * referenced twice as siblings is not mistaken for a cycle.
  */
@@ -56,13 +67,16 @@ export async function encode(
     const entries: Array<[string, unknown]> = [];
     for (const [key, item] of Object.entries(value))
       entries.push([key, await encode(item, ancestors)]);
-    return Object.fromEntries(entries);
+    const object = Object.fromEntries(entries);
+    return TAGS.some((tag) => tag in object)
+      ? { [OBJECT_TAG]: object }
+      : object;
   } finally {
     ancestors.delete(value);
   }
 }
 
-/** Inverse of {@link encode}. Idempotent: already-decoded Buffers and Dates pass through untouched. */
+/** Inverse of {@link encode}, once per crossing: a second pass would read an object it unwrapped as a wire form. */
 export function decode(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
   if (Buffer.isBuffer(value) || value instanceof Date) return value;
@@ -70,6 +84,8 @@ export function decode(value: unknown): unknown {
   if (isWireDate(value)) return new Date(value[DATE_TAG]);
   if (Array.isArray(value)) return value.map(decode);
   return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [key, decode(item)]),
+    Object.entries(isWireObject(value) ? value[OBJECT_TAG] : value).map(
+      ([key, item]) => [key, decode(item)],
+    ),
   );
 }

@@ -2,7 +2,6 @@ import type { Attachment, Message } from "chat";
 import { Message as MessageClass } from "chat";
 
 import type { AttachmentBudget, AttachmentRegistry } from "../host/attachments";
-import { decode, encode } from "./codec";
 
 type SerializedMessage = Parameters<typeof MessageClass.fromJSON>[0];
 
@@ -86,7 +85,7 @@ export async function serializeMessage(
     }
   }
 
-  return encode({ ...serialized, attachments });
+  return { ...serialized, attachments };
 }
 
 export type AttachmentResolver = (
@@ -97,7 +96,7 @@ export function deserializeMessage(
   wire: unknown,
   resolve?: AttachmentResolver,
 ): Message {
-  const decoded = decode(wire) as SerializedMessage & {
+  const decoded = wire as SerializedMessage & {
     attachments: WireAttachment[];
   };
   const message = MessageClass.fromJSON(decoded);

@@ -15,6 +15,7 @@ import {
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 export interface DispatchOptions {
+  /** Shared HMAC secret, identical on both sides. While rotating, a list: the first signs, any verifies. */
   secret: Secret;
   /** Rejects requests whose signed timestamp is older than this. Default 30s. */
   timestampToleranceMs?: number;

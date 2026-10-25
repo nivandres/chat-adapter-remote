@@ -55,8 +55,9 @@ export interface RemoteChatOptions {
   onError?: HostErrorHandler;
   /** Answers `getUserName()`, which cannot be asked of the consumer synchronously. */
   userName?: string;
+  /** Keeps one for a retry, or reports it dropped when it cannot. */
   redeliver?: (entry: QueuedForward) => Promise<void>;
-  /** Holds each forward from before it is sent until the consumer acknowledges it. */
+  /** Holds each forward from before it is sent until the consumer acknowledges it; `hold` reports a store that fails rather than rejecting. */
   journal?: {
     hold(entry: QueuedForward): Promise<void>;
     release(id: string): Promise<void>;
@@ -74,6 +75,9 @@ export interface RemoteChatOptions {
 
 /** Arrivals queue behind any backlog, so a latecomer cannot overtake it. */
 class ForwardBacklogError extends Error {}
+
+/** How long a forward waits for the journal before it is sent anyway. */
+const JOURNAL_WAIT_MS = 1_000;
 
 function createLimiter(limit: number, maxQueued: number) {
   const waiting: Array<() => void> = [];
@@ -163,7 +167,7 @@ class RemoteChat {
     const kept = await this.keep(method, params, threadId);
     try {
       await this.limit(() => this.rpc.request(method, params));
-      if (kept) await this.release(kept);
+      if (kept) void this.release(kept);
     } catch (error) {
       await this.undelivered(method, params, threadId, error, kept);
     }
@@ -183,7 +187,7 @@ class RemoteChat {
     );
   }
 
-  /** A store that fails only costs the guarantee, never the forward. */
+  /** A store that fails or lags only costs the guarantee, never the forward. */
   private async keep(
     method: string,
     params: unknown[],
@@ -191,17 +195,17 @@ class RemoteChat {
   ): Promise<QueuedForward | undefined> {
     const journal = this.options.journal;
     if (!journal) return undefined;
-    try {
-      const entry = await this.entryFor(method, params, threadId);
-      await journal.hold(entry);
-      return entry;
-    } catch (error) {
-      this.logger.warn(`could not keep ${method} before sending it`, {
-        threadId,
-        error,
-      });
-      return undefined;
-    }
+    const entry = await this.entryFor(method, params, threadId).catch(
+      () => undefined,
+    );
+    if (!entry) return undefined;
+    let waited: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      journal.hold(entry),
+      new Promise((resolve) => (waited = setTimeout(resolve, JOURNAL_WAIT_MS))),
+    ]);
+    clearTimeout(waited);
+    return entry;
   }
 
   private async release(entry: QueuedForward): Promise<void> {
@@ -231,7 +235,7 @@ class RemoteChat {
       );
       return;
     }
-    if (kept) await this.release(kept);
+    if (kept) void this.release(kept);
     this.logger.error(`failed to deliver ${method} to consumer`, {
       threadId,
       error,

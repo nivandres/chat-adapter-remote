@@ -27,8 +27,10 @@ import {
   RemoteAdapterRpcError,
   RpcErrorCode,
   StreamDiscardedError,
+  isMisconfigured,
   isTransient,
   isUndelivered,
+  isUnreachable,
   serializeError,
 } from "../rpc/errors";
 import {
@@ -85,8 +87,11 @@ import { StreamRegistry } from "./streams";
 export interface ServeAdapterOptions extends DispatchOptions {
   /** URL of the consumer's inbound endpoint. */
   consumerUrl: string;
+  /** How long a call waits for its answer. Default 10 seconds. */
   timeoutMs?: number;
+  /** Where its own lines go. Default a `ConsoleLogger` at "info". */
   logger?: Logger;
+  /** How it reaches the other side. Default the global `fetch`. */
   fetch?: FetchLike;
   /** Receives failures from every phase. */
   onError?: HostErrorHandler;
@@ -155,8 +160,12 @@ function failure(
   code: number,
   message: string,
   data?: unknown,
+  status?: number,
 ): Response {
-  return Response.json({ jsonrpc: "2.0", id, error: { code, message, data } });
+  return Response.json(
+    { jsonrpc: "2.0", id, error: { code, message, data } },
+    { status },
+  );
 }
 
 export interface HostHealth {
@@ -291,9 +300,16 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       this.redelivery = new Redelivery({
         queue: options.forwardQueue ?? this.memoryQueue!,
         ...options.forwardRetry,
-        send: (method, params) => this.toConsumer.request(method, params),
+        // Kept as it crossed, so it is decoded before it crosses again.
+        send: (method, params) =>
+          this.toConsumer.request(method, decode(params)),
         isUndelivered,
+        isUnreachable,
         onDropped: dropped,
+        onError: (error) => {
+          this.logger.error("the forward queue failed", { error });
+          options.onError?.(error, { phase: "forward" });
+        },
       });
     }
 
@@ -405,10 +421,11 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
     };
   }
 
-  /** A call the consumer answered, even with an error, proves it reachable. */
+  /** A call the consumer answered, even with an error, proves it reachable, unless it refused this side altogether. */
   private track({ direction, method, error }: RequestEvent): void {
     if (direction !== "sent") return;
-    this.consumer = isTransient(error) ? "down" : "up";
+    this.consumer =
+      isTransient(error) || isMisconfigured(error) ? "down" : "up";
     if (method === "state") return;
     if (error) {
       this.forwards.failed++;
@@ -444,7 +461,8 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       this.logger.error("request could not be handled", { error });
       this.options.onError?.(error, { phase: "dispatch" });
       const wire = serializeError(error);
-      return failure(null, wire.code, wire.message, wire.data);
+      // Never handled, so a 5xx lets the consumer send it again.
+      return failure(null, wire.code, wire.message, wire.data, 500);
     });
     response.headers.set(HANDSHAKE_HEADER, this.fingerprint());
     return this.options.encrypt
@@ -469,7 +487,13 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       );
     }
     if (this.stopped) {
-      return failure(id, RpcErrorCode.INTERNAL_ERROR, "Host is stopped");
+      return failure(
+        id,
+        RpcErrorCode.INTERNAL_ERROR,
+        "Host is stopped",
+        undefined,
+        503,
+      );
     }
 
     const call = OUTBOUND_CALLS.safeParse({

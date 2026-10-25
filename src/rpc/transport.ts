@@ -4,6 +4,7 @@ import { JsonRpcResponseSchema, isErrorResponse } from "./envelope";
 import {
   RemoteAdapterRpcError,
   RpcErrorCode,
+  UnreachableError,
   deserializeError,
   isTransient,
 } from "./errors";
@@ -80,7 +81,7 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     method: string,
     params: unknown,
     id?: string,
-  ): Promise<{ response: Response; nonce: string }> {
+  ): Promise<{ response: Response; answer: string | null; nonce: string }> {
     const nonce = crypto.randomUUID();
     const plain = JSON.stringify({
       jsonrpc: "2.0",
@@ -94,8 +95,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     const timestamp = String(Date.now());
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response: Response | undefined;
     try {
-      const response = await doFetch(options.url, {
+      response = await doFetch(options.url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -111,9 +113,16 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
         },
         body,
         signal: controller.signal,
+        // Followed, a redirect would post the signed body wherever it points.
+        redirect: "error",
       });
       if (response.status < 500) reached();
-      return { response, nonce };
+      // Under the same deadline, or a body that stalls would hold the call forever.
+      return {
+        response,
+        answer: await readBody(response, maxBodyBytes),
+        nonce,
+      };
     } catch (error) {
       if (controller.signal.aborted) {
         throw new RemoteAdapterRpcError(
@@ -121,7 +130,9 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
           `chat-adapter-remote: ${method} got no answer within ${timeoutMs}ms`,
         );
       }
-      throw new RemoteAdapterRpcError(
+      // Answered, so it may have been handled.
+      if (response) throw error;
+      throw new UnreachableError(
         RpcErrorCode.UNAVAILABLE,
         `chat-adapter-remote: ${options.url} is unreachable (${(error as Error).message})`,
       );
@@ -135,30 +146,31 @@ export function createRpcClient(options: RpcClientOptions): RpcClient {
     params: unknown,
     id: string,
   ): Promise<unknown> {
-    const { response, nonce } = await send(method, params, id);
-    const body = await readBody(response, maxBodyBytes);
-    if (body === null) {
+    const { response, answer, nonce } = await send(method, params, id);
+    if (answer === null) {
       throw new RemoteAdapterRpcError(
         RpcErrorCode.INVALID_REQUEST,
         `chat-adapter-remote: response larger than ${maxBodyBytes} bytes`,
       );
     }
     const opened = options.encrypt
-      ? unseal(body, options.secret, `response.${nonce}`)
+      ? unseal(answer, options.secret, `response.${nonce}`)
       : null;
-    const text = opened ?? body;
+    const text = opened ?? answer;
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
     } catch {
       parsed = undefined;
     }
-    // Never handled, so the one case a caller can safely retry.
-    if (response.status >= 500) {
+    // Never handled, so the one case a caller can safely retry; a 404 means nothing serves that URL.
+    if (response.status >= 500 || response.status === 404) {
       const reason = (parsed as { error?: { message?: string } } | undefined)
         ?.error?.message;
       throw new RemoteAdapterRpcError(
-        RpcErrorCode.UNAVAILABLE,
+        response.status === 404
+          ? RpcErrorCode.METHOD_NOT_FOUND
+          : RpcErrorCode.UNAVAILABLE,
         `chat-adapter-remote: ${method} answered HTTP ${response.status}${reason ? ` (${reason})` : ""}`,
       );
     }

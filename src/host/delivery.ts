@@ -14,6 +14,8 @@ export interface QueuedForward {
 export interface ForwardQueue {
   /** Resolves with any entries evicted to make room, reported as `overflow`. */
   push(entry: QueuedForward): Promise<QueuedForward[] | void>;
+  /** As `push`, for one a host is still sending: outside any cap, so a burst in flight cannot evict the backlog. `push` stands in without it. */
+  hold?(entry: QueuedForward): Promise<QueuedForward[] | void>;
   /** Removes and returns what is due, oldest first. */
   takeDue(now: number): Promise<QueuedForward[]>;
   /** How many are waiting, for health checks. */
@@ -73,7 +75,7 @@ export function createMemoryForwardQueue(maxEntries = 1000): ForwardQueue {
 export interface StateForwardQueueOptions {
   /** Prefix of its keys; give each host sharing a store its own. Default "chat-adapter-remote:forwards". */
   key?: string;
-  /** Entries kept; past it the oldest are evicted. Default 1000. */
+  /** Entries waiting to be sent again; past it the oldest are evicted. Those still being sent do not count. Default 1000. */
   maxEntries?: number;
   /** How long an entry lasts in the store; keep it above `forwardRetry.retentionMs`. Default 7 days. */
   ttlMs?: number;
@@ -82,6 +84,7 @@ export interface StateForwardQueueOptions {
 interface IndexedForward {
   id: string;
   nextAttemptAt: number;
+  held?: boolean;
 }
 
 const LOCK_TTL_MS = 10_000;
@@ -98,6 +101,15 @@ export function createStateForwardQueue(
   const entryKey = (id: string) => `${key}:${id}`;
   let connected: Promise<void> | undefined;
   let tail: Promise<unknown> = Promise.resolve();
+
+  /** A failed connection is not remembered, so the next call tries again. */
+  function connect(): Promise<void> {
+    connected ??= state.connect().catch((error: unknown) => {
+      connected = undefined;
+      throw error;
+    });
+    return connected;
+  }
 
   async function lock(): Promise<Lock> {
     const deadline = Date.now() + LOCK_TTL_MS;
@@ -116,7 +128,7 @@ export function createStateForwardQueue(
     change: (index: IndexedForward[]) => [IndexedForward[], T],
   ): Promise<T> {
     const run = tail.then(async () => {
-      await (connected ??= state.connect());
+      await connect();
       const held = await lock();
       try {
         const [index, result] = change(
@@ -140,21 +152,28 @@ export function createStateForwardQueue(
     return entries.filter((entry) => entry !== null);
   }
 
+  async function put(
+    entry: QueuedForward,
+    held: boolean,
+  ): Promise<QueuedForward[]> {
+    await connect();
+    // The entry before its index, so a crash between them leaves an orphan the TTL clears, never a lost entry.
+    await state.set(entryKey(entry.id), entry, ttlMs);
+    const evicted = await update((index) => {
+      const next = [
+        ...index.filter(({ id }) => id !== entry.id),
+        { id: entry.id, nextAttemptAt: entry.nextAttemptAt, held },
+      ];
+      const waiting = next.filter((indexed) => !indexed.held);
+      const out = waiting.slice(0, Math.max(0, waiting.length - maxEntries));
+      return [next.filter((indexed) => !out.includes(indexed)), out];
+    });
+    return take(evicted);
+  }
+
   return {
-    async push(entry) {
-      await (connected ??= state.connect());
-      // The entry before its index, so a crash between them leaves an orphan the TTL clears, never a lost entry.
-      await state.set(entryKey(entry.id), entry, ttlMs);
-      const evicted = await update((index) => {
-        const next = [
-          ...index.filter(({ id }) => id !== entry.id),
-          { id: entry.id, nextAttemptAt: entry.nextAttemptAt },
-        ];
-        const excess = Math.max(0, next.length - maxEntries);
-        return [next.slice(excess), next.slice(0, excess)];
-      });
-      return take(evicted);
-    },
+    push: (entry) => put(entry, false),
+    hold: (entry) => put(entry, true),
     async takeDue(now) {
       const due = await update((index) => [
         index.filter(({ nextAttemptAt }) => nextAttemptAt > now),
@@ -165,7 +184,7 @@ export function createStateForwardQueue(
       );
     },
     async size() {
-      await (connected ??= state.connect());
+      await connect();
       return ((await state.get<IndexedForward[]>(key)) ?? []).length;
     },
     async remove(id) {
@@ -192,13 +211,19 @@ export interface RedeliveryOptions extends ForwardRetryOptions {
   queue: ForwardQueue;
   send: (method: string, params: unknown[]) => Promise<unknown>;
   isUndelivered: (error: unknown) => boolean;
+  /** Nothing answered, so the rest of a pass would fail alike. */
+  isUnreachable: (error: unknown) => boolean;
   onDropped: DroppedForwardHandler;
+  /** A pass that failed, or a forward still being sent that the store could not keep. */
+  onError: (error: unknown) => void;
 }
 
 export class Redelivery {
   private timer?: ReturnType<typeof setInterval>;
   private draining?: Promise<void>;
+  /** Being sent by this process, so a pass never sends them as well. */
   private readonly sending = new Set<string>();
+  private turn: Promise<unknown> = Promise.resolve();
 
   private readonly intervalMs: number;
   private readonly backoff: number;
@@ -222,38 +247,67 @@ export class Redelivery {
   }
 
   keep(entry: QueuedForward): Promise<void> {
-    this.sending.delete(entry.id);
-    return this.schedule(entry);
+    return this.exclusive(() => {
+      this.sending.delete(entry.id);
+      return this.schedule(entry);
+    });
   }
 
   /** Kept while this process sends it, so retries leave it alone and a crash does not lose it. */
   hold(entry: QueuedForward): Promise<void> {
     this.sending.add(entry.id);
-    return this.schedule(entry);
+    return this.exclusive(() => this.schedule(entry, true));
   }
 
-  /** Forgets one that was acknowledged or given up on. */
-  async release(id: string): Promise<void> {
-    this.sending.delete(id);
-    await this.options.queue.remove?.(id);
-  }
-
-  private schedule(entry: QueuedForward): Promise<void> {
-    return this.store({
-      ...entry,
-      nextAttemptAt: entry.firstAttemptAt + this.delayAfter(entry.attempts),
+  /** Forgets one that was acknowledged or given up on; no pass sends it while the store still has it. */
+  release(id: string): Promise<void> {
+    return this.exclusive(async () => {
+      await this.options.queue.remove?.(id);
+      this.sending.delete(id);
     });
   }
 
-  private async store(entry: QueuedForward): Promise<void> {
-    for (const evicted of (await this.options.queue.push(entry)) ?? []) {
-      this.options.onDropped(evicted, "overflow", undefined);
+  private schedule(entry: QueuedForward, held = false): Promise<void> {
+    return this.store(
+      {
+        ...entry,
+        nextAttemptAt: entry.firstAttemptAt + this.delayAfter(entry.attempts),
+      },
+      held,
+    );
+  }
+
+  /** Never rejects: a forward the store cannot keep is dropped, or reported while it is still being sent. */
+  private async store(entry: QueuedForward, held = false): Promise<void> {
+    const { queue } = this.options;
+    try {
+      const evicted =
+        held && queue.hold ? await queue.hold(entry) : await queue.push(entry);
+      // One still being sent here is not lost, only no longer kept.
+      for (const out of evicted ?? []) {
+        if (!this.sending.has(out.id)) {
+          this.options.onDropped(out, "overflow", undefined);
+        }
+      }
+    } catch (error) {
+      if (held) this.options.onError(error);
+      else this.options.onDropped(entry, "expired", error);
     }
+  }
+
+  /** One change at a time, so a release cannot land between a pass taking an entry and putting it back. */
+  private exclusive<T>(change: () => Promise<T>): Promise<T> {
+    const run = this.turn.then(change);
+    this.turn = run.catch(() => undefined);
+    return run;
   }
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.drain(), this.intervalMs);
+    this.timer = setInterval(
+      () => void this.drain().catch(this.options.onError),
+      this.intervalMs,
+    );
     this.timer.unref?.();
   }
 
@@ -272,17 +326,18 @@ export class Redelivery {
 
   private async attemptDue(): Promise<void> {
     const now = Date.now();
-    const taken = await this.options.queue.takeDue(now);
-    for (const entry of taken) {
-      if (this.sending.has(entry.id)) await this.store(entry);
-    }
-    const due = taken.filter((entry) => !this.sending.has(entry.id));
+    const due = await this.exclusive(() => this.takeDue(now));
     for (const [index, entry] of due.entries()) {
       try {
         await this.options.send(entry.method, entry.params);
       } catch (error) {
         if (!this.options.isUndelivered(error)) {
           this.options.onDropped(entry, "rejected", error);
+          continue;
+        }
+        // Answered, but not taken: this one backs off on its own and the rest still go out.
+        if (!this.options.isUnreachable(error)) {
+          await this.reschedule(entry, now, error, true);
           continue;
         }
         // Still down: the rest wait for the next pass rather than each probing.
@@ -292,6 +347,23 @@ export class Redelivery {
         return;
       }
     }
+  }
+
+  /** What this process is still sending goes back, kept for a crash until its retention runs out. */
+  private async takeDue(now: number): Promise<QueuedForward[]> {
+    const taken = await this.options.queue.takeDue(now);
+    const held = taken.filter((entry) => this.sending.has(entry.id));
+    for (const entry of held) {
+      if (now - entry.firstAttemptAt >= this.retentionMs) {
+        this.sending.delete(entry.id);
+        continue;
+      }
+      await this.store(
+        { ...entry, nextAttemptAt: now + this.delayAfter(entry.attempts) },
+        true,
+      );
+    }
+    return taken.filter((entry) => !held.includes(entry));
   }
 
   private async reschedule(
