@@ -1,16 +1,22 @@
 # chat-adapter-remote
 
+> npm package: [`chat-adapter-remote`](https://www.npmjs.com/package/chat-adapter-remote)
+
+[![npm version](https://img.shields.io/npm/v/chat-adapter-remote?style=flat-square&logo=npm&logoColor=white&labelColor=000&color=000)](https://www.npmjs.com/package/chat-adapter-remote)
+[![npm downloads](https://img.shields.io/npm/dm/chat-adapter-remote?style=flat-square&logo=npm&logoColor=white&labelColor=000&color=000)](https://www.npmjs.com/package/chat-adapter-remote)
+[![MIT License](https://img.shields.io/badge/License-MIT-000?style=flat-square&logo=opensourceinitiative&logoColor=white&labelColor=000&color=000)](./LICENSE)
+
 Run any [Chat SDK](https://chat-sdk.dev) `Adapter` in a different process from your bot logic, bridged over signed HTTP JSON-RPC.
 
 Some platforms — WhatsApp via Baileys, for example — need a process that holds a live connection continuously. This splits that connection from the bot logic: a **host** process holds the real, unmodified adapter; a **consumer** process holds the real `Chat` instance and your handlers. Neither side changes; `Chat` sees an ordinary adapter, and the adapter sees an ordinary `ChatInstance`.
+
+## Installation
 
 ```bash
 npm i chat-adapter-remote
 ```
 
 ESM only, Node >= 20 or Bun. Peers: `chat` and `@chat-adapter/shared`, which must be installed at matching versions.
-
-`url`, `consumerUrl` and `secret` fall back to `CHAT_ADAPTER_REMOTE_URL`, `CHAT_ADAPTER_REMOTE_CONSUMER_URL` and `CHAT_ADAPTER_REMOTE_SECRET`.
 
 ## Host
 
@@ -74,7 +80,7 @@ process.on("SIGTERM", () => host.stop());
 
 `start()` is idempotent; `ready` is shorthand for it. `stop()` disconnects the adapter, drops open streams, and refuses further dispatch. `onError` covers the `initialize`, `forward`, `dispatch`, `shutdown` and `adapter` phases.
 
-A `GET` on the host's route answers `{ status, consumer, forwards, lastForwardAt, openStreams, queuedForwards }`, 200 once the adapter is ready and 503 otherwise, for health probes; it is unsigned and tells nothing else. `consumer` is `"up"` or `"down"` after the last call to it, and `forwards` counts the events sent, the attempts that failed and those given up on. A consumer that is down never turns the probe to 503: restarting the host would not bring it back. Give the host `healthy: () => …` to fold in the adapter's own connection — for wwebjs, `() => adapter.connection === "connected"` — and a dead session answers 503 with `adapter: "down"`. `onRequest`, on either side, receives every request with its direction, method, duration and error, for metrics.
+A `GET` on the host's route answers `{ status, consumer, forwards, lastForwardAt, openStreams, queuedForwards }`, 200 once the adapter is ready and 503 otherwise, for health probes; it is unsigned and tells nothing else. `consumer` is `"up"` or `"down"` after the last call to it — down too while it refuses the secret or nothing answers at that URL — and `forwards` counts the events sent, the attempts that failed and those given up on. A consumer that is down never turns the probe to 503: restarting the host would not bring it back. Give the host `healthy: () => …` to fold in the adapter's own connection — for wwebjs, `() => adapter.connection === "connected"` — and a dead session answers 503 with `adapter: "down"`. `onRequest`, on either side, receives every request with its direction, method, duration and error, for metrics.
 
 `host.emit({ type: "qr", code })` reaches the consumer's `onEvent`, for showing a pairing QR or connection state in your own UI.
 
@@ -111,7 +117,9 @@ The host's `stream.mode` can stream for an adapter that has none. `"buffer"` gat
 
 ## Delivery
 
-A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. The queue lives in memory by default, and what it still holds when the host stops is reported as `"stopped"`; pass a `forwardQueue` to keep it somewhere shared, across restarts and reloads. `createStateForwardQueue(state)` keeps it in any Chat SDK state adapter — Redis, Postgres — under its own `key`, which hosts sharing one store each need. Add `journalForwards: true` and every forward is kept there from before it is sent until the consumer acknowledges it, so a crash loses neither the backlog nor what was in flight. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
+A forward that never reached the consumer is sent again every minute for 24 hours (`forwardRetry`: `intervalMs`, `backoff`, `maxIntervalMs`, `retentionMs`, `maxAttempts`), and reported to `onDropped` if it never arrives. One that timed out is not, since it may have been handled. Each backs off on its own: one the consumer keeps answering with a server error holds up none of the rest, and only a consumer that does not answer at all makes them wait for the next pass. The queue lives in memory by default, and what it still holds when the host stops is reported as `"stopped"`; pass a `forwardQueue` to keep it somewhere shared, across restarts and reloads. `createStateForwardQueue(state)` keeps it in any Chat SDK state adapter — Redis, Postgres — under its own `key`, which hosts sharing one store each need. Add `journalForwards: true` and every forward is kept there from before it is sent until the consumer acknowledges it, so a crash loses neither the backlog nor what was in flight; those still being sent do not count toward its `maxEntries`, nor toward the cap of a queue of your own that implements `hold()`. A store that fails, or takes longer than a second, costs only that guarantee: the forward is still sent, and one the store cannot keep for a retry is reported as `"expired"`. An acknowledgement means "received", not "handled". Chat deduplicates a resend for 10 minutes, so one acknowledged late and resent after that can be handled twice.
+
+A host never resends a forward it is still sending, or one the consumer acknowledged. Hosts sharing one `key` — replicas, or a tenant reloaded while its old host finishes — cannot see each other's, so one that waited longer than `intervalMs` to be sent, behind a backlog, can be sent by both. Give each its own key, or keep `intervalMs` well above the longest a forward waits.
 
 Log lines and `host.emit()` events are best effort, never retried. Lines from `"warn"` up cross by default (`logForwardLevel`). While the consumer is unreachable they stay on the host and are counted, and the count is reported once it answers again, so an adapter stuck in a reconnect loop cannot flood it.
 
@@ -130,6 +138,78 @@ Attachments are inlined as base64 while they stay under about 4 MB, or under `ma
 - An unsigned or stale request is refused before its body is read, and a body past `maxBodyBytes` (32 MiB by default) is never buffered. Raise it to send larger files inline.
 - Adapter errors are rebuilt as their original class on the far side. Unrecognized errors collapse to a generic message, so host internals never leave the host.
 - One shared secret covers both directions, and a leaked one grants full send-as-the-bot access. An empty secret, alone or in a list, is refused. To rotate it, give both sides `[old, new]`, then `[new, old]`, then `new`: the first entry signs and any of them verifies.
+- Signatures cover the body, not the URL: give each adapter under `serveAdapters` or `serveTenants` its own secret, or one shared `replayGuard`, or a request signed for one can be replayed to another inside its window.
+- Neither side follows a redirect, so a signed body only ever goes to the URL it was given.
+
+## Configuration
+
+### `createRemoteAdapter`
+
+| Option                 | Default                                | Description                                                                                                                |
+| ---------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `url`                  | `CHAT_ADAPTER_REMOTE_URL`              | The host's dispatch endpoint. Required.                                                                                    |
+| `secret`               | `CHAT_ADAPTER_REMOTE_SECRET`           | Shared HMAC secret, identical on both sides. While rotating, a list: the first signs, any verifies. Required.              |
+| `name`                 | `"remote"`                             | The key it is registered under; thread ids are translated to it.                                                           |
+| `userName`             | the host's                             | Overrides the bot username learned from the handshake.                                                                     |
+| `timeoutMs`            | 10 seconds                             | How long a call waits for its answer.                                                                                      |
+| `timestampToleranceMs` | 30 seconds                             | Oldest signed timestamp accepted.                                                                                          |
+| `maxBodyBytes`         | unlimited                              | Largest body read.                                                                                                         |
+| `onError`              |                                        | Inbound failures, beyond the logger.                                                                                       |
+| `hostState`            | `"scoped"`                             | `"scoped"` lends keyed operations under a prefix, `"full"` the whole store, `"off"` nothing.                               |
+| `onEvent`              |                                        | What the host sends with `host.emit()`, such as a QR code.                                                                 |
+| `replayGuard`          | per process                            | Share one across instances.                                                                                                |
+| `maxCachedThreads`     | `1000`                                 | Thread facts kept in memory.                                                                                               |
+| `retry`                | `{ maxAttempts: 3, intervalMs: 1000 }` | Tries again a call that got no answer, only against a host that answers a retry once. `false` disables.                    |
+| `onRequest`            |                                        | Every request sent or received.                                                                                            |
+| `encrypt`              | `false`                                | Seal every body both ways under a key from `secret`, so even plain HTTP reveals and alters nothing. Both sides must agree. |
+| `logger`               | `ConsoleLogger` at `"info"`            | Where its own lines go.                                                                                                    |
+| `fetch`                | the global `fetch`                     | How it reaches the other side.                                                                                             |
+
+### `serveAdapter`
+
+The same for `createAdapterHost` and each entry of `serveAdapters` and `serveTenants`.
+
+| Option                     | Default                            | Description                                                                                                                             |
+| -------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `consumerUrl`              | `CHAT_ADAPTER_REMOTE_CONSUMER_URL` | URL of the consumer's inbound endpoint. Required.                                                                                       |
+| `secret`                   | `CHAT_ADAPTER_REMOTE_SECRET`       | Shared HMAC secret, identical on both sides. While rotating, a list: the first signs, any verifies. Required.                           |
+| `timestampToleranceMs`     | 30 seconds                         | Rejects requests whose signed timestamp is older than this.                                                                             |
+| `maxBodyBytes`             | 32 MiB                             | Rejects bodies larger than this, read before the signature can be checked.                                                              |
+| `replayGuard`              | per process                        | Rejects a signature that was already accepted inside the freshness window.                                                              |
+| `encrypt`                  | `false`                            | Expect sealed bodies, and seal the answers; safe over plain HTTP. Both sides must agree.                                                |
+| `timeoutMs`                | 10 seconds                         | How long a call waits for its answer.                                                                                                   |
+| `logger`                   | `ConsoleLogger` at `"info"`        | Where its own lines go.                                                                                                                 |
+| `fetch`                    | the global `fetch`                 | How it reaches the other side.                                                                                                          |
+| `onError`                  |                                    | Receives failures from every phase.                                                                                                     |
+| `onRequest`                |                                    | Every request sent or received.                                                                                                         |
+| `healthy`                  |                                    | Whether the adapter's own connection works; `false` makes `/health` answer 503 with `adapter: "down"`.                                  |
+| `onReady`                  |                                    | Called once the wrapped adapter has initialized.                                                                                        |
+| `logForwardLevel`          | `"warn"`                           | Lines below this level stay on the host instead of crossing the wire.                                                                   |
+| `maxConcurrentForwards`    | `8`                                | Inbound messages forwarded at once.                                                                                                     |
+| `maxQueuedForwards`        | `1000`                             | Messages allowed to queue behind those.                                                                                                 |
+| `autoStart`                | `true`                             | Initialize during construction; set `false` to control startup with `start()`.                                                          |
+| `streamTtlMs`              | 5 minutes                          | Streams abandoned by the consumer are dropped after this long.                                                                          |
+| `streamStartTimeoutMs`     | 10 seconds                         | How long the adapter may take to start streaming.                                                                                       |
+| `inlineAttachments`        | `"auto"`                           | Inline attachment bytes; `"auto"` inlines while they fit.                                                                               |
+| `attachmentTtlMs`          | 5 minutes                          | How long an attachment the consumer never fetched is kept.                                                                              |
+| `customMethods`            |                                    | Methods outside the `Adapter` interface to expose; `true` for the adapter's own.                                                        |
+| `state`                    | the consumer's                     | Store for the adapter's own `getState()`.                                                                                               |
+| `catchUnhandledRejections` | `true`                             | Keep rejections from the adapter's event loop from ending the process.                                                                  |
+| `forwardRetry`             | every minute for 24 hours          | Resend forwards the consumer never received; `false` disables.                                                                          |
+| `forwardQueue`             | in memory, capped at 1000          | Where those forwards wait.                                                                                                              |
+| `journalForwards`          | `false`                            | Keep every forward in `forwardQueue` until the consumer acknowledges it, so a crash or restart loses none. Needs a queue with `remove`. |
+| `onDropped`                |                                    | Called for a forward that will not be delivered, with why.                                                                              |
+| `stream`                   |                                    | How replies stream; see [Streaming](#streaming).                                                                                        |
+
+## Environment variables
+
+An option you pass wins over its variable.
+
+| Variable                           | Read by  | Option        |
+| ---------------------------------- | -------- | ------------- |
+| `CHAT_ADAPTER_REMOTE_URL`          | consumer | `url`         |
+| `CHAT_ADAPTER_REMOTE_CONSUMER_URL` | host     | `consumerUrl` |
+| `CHAT_ADAPTER_REMOTE_SECRET`       | both     | `secret`      |
 
 ## Limits
 

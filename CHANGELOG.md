@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.9
+
+Hardening from an audit of delivery and the transport. Compatible with 0.8 on either side.
+
+### Fixed
+
+- With `journalForwards`, a forward the consumer acknowledged while a retry pass was taking it from the store was sent again, and one waiting behind a backlog was taken and stored back on every pass. A host now never resends a forward it is still sending or has released; hosts sharing one queue `key` still can, as the README explains.
+- A state store that failed to connect once stayed failed until the host restarted, a retry pass it failed was an unhandled rejection, a forward it could not keep for a retry was lost without reaching `onDropped`, `abortTurn` then rejected into the adapter, and a slow store held back every forward. A failed connection is now tried again, a failed pass reaches `onError`, a forward that cannot be kept is reported as `"expired"`, and a forward waits at most a second for the journal before it is sent anyway.
+- One forward the consumer kept answering with a server error held back every other one until it expired. It now backs off on its own while the rest go out, and only a consumer that does not answer at all makes them wait.
+- Forwards still being sent counted toward `createStateForwardQueue`'s `maxEntries`, so a burst evicted the backlog and reported forwards in flight as `"overflow"`. They no longer count — a `ForwardQueue` of your own can do the same by implementing `hold()` — and none still being sent is reported as overflow.
+- An answer whose body stalled after its headers held the call open forever; eight of them stopped forwarding altogether. `timeoutMs` now covers the body.
+- A redirect was followed, posting the signed, possibly unsealed, body wherever it pointed. Neither side follows one now.
+- A stopped host, or one whose replay store failed, answered with an error the consumer took as final. It now answers 503 or 500, so the consumer tries again.
+- `/health` reported the consumer `"up"` while it refused the secret or nothing answered at that URL, so a misconfigured bridge looked healthy while every forward failed. It now reports `"down"`.
+- Platform data holding an object with a `__charDate` or `__charBuffer` key arrived as an Invalid Date or a Buffer. Such objects are now wrapped on the wire, and arrive as they were sent once both sides run 0.8.9.
+
 ## 0.8.8
 
 Compatible with 0.8 on either side.
