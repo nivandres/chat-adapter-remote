@@ -475,7 +475,7 @@ describe("misconfiguration", () => {
 
     const response = await b.host.handleRequest(hostile);
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(500);
     expect((await response.json()).error).toBeDefined();
   });
 

@@ -3,6 +3,7 @@ import type { ChatInstance } from "chat";
 import { describe, expect, it, vi } from "vitest";
 
 import { createAdapterHost, serveAdapter } from "../host";
+import { RpcErrorCode } from "../rpc/errors";
 import { sign } from "../rpc/signing";
 import {
   CONSUMER_URL,
@@ -92,6 +93,8 @@ describe("host lifecycle", () => {
       }),
     );
 
+    // A 5xx, so the consumer tries again rather than taking it as an answer.
+    expect(response.status).toBe(503);
     expect((await response.json()).error.message).toMatch(/stopped/i);
   });
 
@@ -291,6 +294,40 @@ describe("health", () => {
       forwards: { sent: 1, failed: 1, dropped: 1 },
     });
     expect(health.lastForwardAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("counts a consumer that refuses its secret, or is not at that URL, as down", async () => {
+    let chat!: ChatInstance;
+    const adapter = createMockAdapter("mock", {
+      initialize: vi.fn(
+        async (instance: ChatInstance) => void (chat = instance),
+      ),
+    });
+    const answers = [
+      Response.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: RpcErrorCode.UNAUTHORIZED,
+            message: "Invalid signature",
+          },
+        },
+        { status: 401 },
+      ),
+      new Response("Not Found", { status: 404 }),
+    ];
+    const host = serveAdapter(adapter, {
+      ...options,
+      forwardRetry: false,
+      fetch: vi.fn(async () => answers.shift()!),
+    });
+    await host.ready;
+
+    for (const text of ["wrong secret", "wrong url"]) {
+      await chat.processMessage(adapter, "mock:c:1", message(text));
+      expect((await host.health()).consumer).toBe("down");
+    }
   });
 });
 

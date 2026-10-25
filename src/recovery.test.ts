@@ -7,12 +7,16 @@ import { createRemoteAdapter } from "./adapter";
 import { createStateForwardQueue, serveAdapter } from "./host";
 import { CallLedger } from "./host/call-ledger";
 import { forwardEntry } from "./host/delivery";
-import { RpcErrorCode } from "./rpc/errors";
+import { decode } from "./rpc/codec";
+import { RpcErrorCode, isUndelivered, isUnreachable } from "./rpc/errors";
+import { createRpcClient } from "./rpc/transport";
 import {
   CONSUMER_URL,
   HOST_URL,
   SECRET,
+  bridge,
   deferred,
+  handshake,
   message,
 } from "./testing/bridge";
 import type { FetchLike, RemoteAdapterConfig } from "./types";
@@ -265,7 +269,9 @@ describe("redelivery", () => {
         );
       },
       isUndelivered: () => true,
+      isUnreachable: () => true,
       onDropped: () => {},
+      onError: () => {},
     });
     const entry = forwardEntry("processMessage", [], THREAD);
     await redelivery.keep({ ...entry, firstAttemptAt: 0, attempts: 3 });
@@ -289,7 +295,9 @@ describe("redelivery", () => {
         delivered.push(text);
       },
       isUndelivered: () => false,
+      isUnreachable: () => false,
       onDropped,
+      onError: () => {},
     });
     await redelivery.keep(forwardEntry("processMessage", ["refused"], THREAD));
     await redelivery.keep(forwardEntry("processMessage", ["kept"], THREAD));
@@ -304,6 +312,107 @@ describe("redelivery", () => {
     expect(delivered).toEqual(["kept"]);
   });
 
+  it("retries one the consumer keeps failing on its own, and holds the rest back only while it is unreachable", async () => {
+    const { Redelivery, createMemoryForwardQueue, forwardEntry } =
+      await import("./host/delivery");
+    const link = { up: true };
+    const sent: string[] = [];
+    const client = createRpcClient({
+      url: CONSUMER_URL,
+      secret: SECRET,
+      fetch: async (_input, init) => {
+        const body = JSON.parse(String(init?.body));
+        sent.push(body.params[0]);
+        if (!link.up) throw new TypeError("fetch failed");
+        return body.params[0] === "poison"
+          ? new Response("boom", { status: 500 })
+          : Response.json({ jsonrpc: "2.0", id: body.id, result: null });
+      },
+    });
+    const queue = createMemoryForwardQueue();
+    const redelivery = new Redelivery({
+      queue,
+      intervalMs: 0,
+      send: (method, params) => client.request(method, params),
+      isUndelivered,
+      isUnreachable,
+      onDropped: () => {},
+      onError: () => {},
+    });
+    for (const text of ["poison", "one", "two"]) {
+      await redelivery.keep(forwardEntry("processMessage", [text], THREAD));
+    }
+
+    await redelivery.drain();
+    expect(sent).toEqual(["poison", "one", "two"]);
+
+    link.up = false;
+    await redelivery.keep(forwardEntry("processMessage", ["three"], THREAD));
+    await redelivery.drain();
+    expect(sent).toHaveLength(4);
+    expect(await queue.size!()).toBe(2);
+  });
+
+  it("never resends a forward acknowledged while a pass was taking it", async () => {
+    const { Redelivery, createMemoryForwardQueue, forwardEntry } =
+      await import("./host/delivery");
+    const queue = createMemoryForwardQueue();
+    const taken = deferred<void>();
+    const send = vi.fn(async () => undefined);
+    const redelivery = new Redelivery({
+      queue: {
+        ...queue,
+        takeDue: async (now) => {
+          const due = await queue.takeDue(now);
+          await taken.promise;
+          return due;
+        },
+      },
+      intervalMs: 0,
+      send,
+      isUndelivered: () => true,
+      isUnreachable: () => true,
+      onDropped: () => {},
+      onError: () => {},
+    });
+    const entry = forwardEntry("processMessage", [], THREAD);
+    await redelivery.hold(entry);
+
+    const pass = redelivery.drain();
+    const released = redelivery.release(entry.id);
+    taken.resolve();
+    await Promise.all([pass, released]);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(await queue.size!()).toBe(0);
+  });
+
+  it("forgets one it holds once past retention, without sending it", async () => {
+    const { Redelivery, createMemoryForwardQueue, forwardEntry } =
+      await import("./host/delivery");
+    const queue = createMemoryForwardQueue();
+    const send = vi.fn(async () => undefined);
+    const redelivery = new Redelivery({
+      queue,
+      intervalMs: 0,
+      retentionMs: 1000,
+      send,
+      isUndelivered: () => true,
+      isUnreachable: () => true,
+      onDropped: () => {},
+      onError: () => {},
+    });
+    await redelivery.hold({
+      ...forwardEntry("processMessage", [], THREAD),
+      firstAttemptAt: 0,
+    });
+
+    await redelivery.drain();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(await queue.size!()).toBe(0);
+  });
+
   it("drops the oldest entry once the memory queue is full", async () => {
     const { Redelivery, createMemoryForwardQueue, forwardEntry } =
       await import("./host/delivery");
@@ -313,8 +422,10 @@ describe("redelivery", () => {
       queue,
       send: async () => undefined,
       isUndelivered: () => true,
+      isUnreachable: () => true,
       onDropped: (entry, reason) =>
         void overflowed.push([entry.threadId, reason]),
+      onError: () => {},
     });
 
     for (const threadId of ["first", "second", "third"]) {
@@ -325,6 +436,25 @@ describe("redelivery", () => {
     expect(
       (await queue.takeDue(Number.POSITIVE_INFINITY)).map((e) => e.threadId),
     ).toEqual(["second", "third"]);
+  });
+
+  it("never reports one still being sent as overflow", async () => {
+    const { Redelivery, createMemoryForwardQueue, forwardEntry } =
+      await import("./host/delivery");
+    const onDropped = vi.fn();
+    const redelivery = new Redelivery({
+      queue: createMemoryForwardQueue(1),
+      send: async () => undefined,
+      isUndelivered: () => true,
+      isUnreachable: () => true,
+      onDropped,
+      onError: () => {},
+    });
+
+    await redelivery.hold(forwardEntry("processMessage", [], "first"));
+    await redelivery.hold(forwardEntry("processMessage", [], "second"));
+
+    expect(onDropped).not.toHaveBeenCalled();
   });
 
   it("retries on its own timer until stopped", async () => {
@@ -338,7 +468,9 @@ describe("redelivery", () => {
         intervalMs: 1000,
         send,
         isUndelivered: () => true,
+        isUnreachable: () => true,
         onDropped: () => {},
+        onError: () => {},
       });
       await redelivery.keep(forwardEntry("processMessage", [], THREAD));
 
@@ -420,6 +552,83 @@ describe("redelivery", () => {
 
     expect(queued).toHaveLength(1);
     expect(JSON.stringify(queued[0]).length).toBeLessThan(100_000);
+  });
+
+  it("redelivers bytes as they were sent", async () => {
+    const link = { up: false };
+    const received: unknown[] = [];
+    const fetch: FetchLike = async (_input, init) => {
+      if (!link.up) throw new TypeError("fetch failed");
+      const body = JSON.parse(String(init?.body));
+      received.push(decode(body.params[1]));
+      return Response.json({ jsonrpc: "2.0", id: body.id, result: null });
+    };
+    const h = await durableHost(createMemoryState(), fetch);
+    await h.chat().processMessage(
+      h.adapter,
+      THREAD,
+      message("photo", {
+        attachments: [
+          { type: "image", name: "a.png", data: Buffer.from("png") },
+        ],
+      }),
+    );
+
+    link.up = true;
+    await h.redelivery.drain();
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        attachments: [expect.objectContaining({ data: Buffer.from("png") })],
+      }),
+    ]);
+  });
+
+  it("reports a pass the store failed through onError", async () => {
+    const onError = vi.fn();
+    const h = await hostWith(
+      { value: "up" },
+      {
+        onError,
+        forwardRetry: { intervalMs: 5 },
+        forwardQueue: {
+          push: async () => {},
+          takeDue: async () => {
+            throw new Error("redis down");
+          },
+        },
+      },
+    );
+
+    await vi.waitFor(() =>
+      expect(onError).toHaveBeenCalledWith(expect.any(Error), {
+        phase: "forward",
+      }),
+    );
+    await h.host.stop();
+  });
+
+  it("drops a forward the store cannot keep, and never rejects into the adapter", async () => {
+    const h = await hostWith(
+      { value: "down" },
+      {
+        forwardQueue: {
+          push: async () => {
+            throw new Error("redis down");
+          },
+          takeDue: async () => [],
+        },
+      },
+    );
+
+    await expect(h.chat().abortTurn(THREAD)).resolves.toBeUndefined();
+
+    expect(h.onDropped).toHaveBeenCalledWith(
+      expect.objectContaining({ method: "abortTurn" }),
+      "expired",
+      expect.any(Error),
+    );
+    expect((await h.host.health()).forwards.dropped).toBe(1);
   });
 
   it("keeps entries in a queue of your own", async () => {
@@ -516,7 +725,7 @@ describe("durable forwards", () => {
     await h.chat().processMessage(h.adapter, THREAD, message("done"));
 
     expect(up.received).toEqual(["done"]);
-    expect(await h.queue.size!()).toBe(0);
+    await vi.waitFor(async () => expect(await h.queue.size!()).toBe(0));
   });
 
   it("drops a refused forward once, leaving nothing journaled", async () => {
@@ -534,7 +743,7 @@ describe("durable forwards", () => {
       "rejected",
       expect.anything(),
     );
-    expect(await h.queue.size!()).toBe(0);
+    await vi.waitFor(async () => expect(await h.queue.size!()).toBe(0));
   });
 
   it("keeps a forward journaled once while the consumer is down", async () => {
@@ -547,6 +756,33 @@ describe("durable forwards", () => {
     await h.chat().processMessage(h.adapter, THREAD, message("once"));
 
     expect(await h.queue.size!()).toBe(1);
+  });
+
+  it("sends a forward anyway when the store is slow to keep it", async () => {
+    vi.useFakeTimers();
+    try {
+      const up = consumer({ value: "up" });
+      const h = await hostWith(
+        { value: "up" },
+        {
+          fetch: up.fetch,
+          journalForwards: true,
+          forwardQueue: {
+            push: () => new Promise(() => {}),
+            takeDue: async () => [],
+            remove: async () => {},
+          },
+        },
+      );
+
+      const sent = h.chat().processMessage(h.adapter, THREAD, message("now"));
+      await vi.advanceTimersByTimeAsync(1000);
+      await sent;
+
+      expect(up.received).toEqual(["now"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("still forwards when the store fails", async () => {
@@ -588,6 +824,32 @@ describe("durable forwards", () => {
     expect(
       (await queue.takeDue(Number.POSITIVE_INFINITY)).map((e) => e.threadId),
     ).toEqual(["second", "third"]);
+  });
+
+  it("keeps forwards still being sent outside its capacity, so they evict no backlog", async () => {
+    const queue = createStateForwardQueue(createMemoryState(), {
+      maxEntries: 1,
+    });
+
+    await queue.push(forwardEntry("processMessage", [], "backlog"));
+    await queue.hold!(forwardEntry("processMessage", [], "sending"));
+    await queue.hold!(forwardEntry("processMessage", [], "sending"));
+    expect(await queue.size!()).toBe(3);
+
+    const evicted = await queue.push(forwardEntry("processMessage", [], "new"));
+    expect((evicted ?? []).map((entry) => entry.threadId)).toEqual(["backlog"]);
+  });
+
+  it("connects again after a store that failed to connect", async () => {
+    const state = createMemoryState();
+    vi.spyOn(state, "connect").mockRejectedValueOnce(new Error("redis down"));
+    const queue = createStateForwardQueue(state);
+    const entry = forwardEntry("processMessage", [], THREAD);
+
+    await expect(queue.push(entry)).rejects.toThrow("redis down");
+    await queue.push(entry);
+
+    expect(await queue.size!()).toBe(1);
   });
 
   it("keeps hosts sharing a store apart by key", async () => {
@@ -699,6 +961,21 @@ describe("retries", () => {
       h.consumer({ retry: false }).postMessage(THREAD, "slow"),
     ).rejects.toMatchObject({ code: RpcErrorCode.TIMEOUT });
     expect(h.link.sent).toBe(2);
+  });
+
+  it("sends again a call the host could not check", async () => {
+    const seen = vi.fn(async () => false);
+    const b = bridge(
+      {},
+      { replayGuard: { seen } },
+      { retry: { intervalMs: 0 } },
+    );
+    await handshake(b);
+    seen.mockRejectedValueOnce(new Error("replay store down"));
+
+    await b.remote.postMessage(THREAD, "checked");
+
+    expect(b.adapter.postMessage).toHaveBeenCalledOnce();
   });
 
   it("never retries an answer, only the lack of one", async () => {

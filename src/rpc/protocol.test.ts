@@ -8,6 +8,7 @@ import {
 import { Message, parseMarkdown } from "chat";
 import { describe, expect, it, vi } from "vitest";
 
+import { startRealServer } from "../e2e/http-bridge";
 import { decode, encode } from "./codec";
 import { RpcErrorCode, deserializeError, serializeError } from "./errors";
 import { deserializeMessage, serializeMessage } from "./message-wire";
@@ -138,6 +139,18 @@ describe("codec", () => {
     expect(decode(restored)).toEqual(restored);
   });
 
+  it("hands back platform data that looks like a wire form as it was", async () => {
+    const value = {
+      lookalike: { __charDate: "soon", __charBuffer: "aGk=", __charObject: {} },
+      when: new Date("2024-01-01T00:00:00.000Z"),
+    };
+
+    const wire = JSON.parse(JSON.stringify(await encode(value)));
+
+    expect(wire.when).toEqual({ __charDate: "2024-01-01T00:00:00.000Z" });
+    expect(decode(wire)).toEqual(value);
+  });
+
   it("allows shared references but not cycles", async () => {
     const shared = { id: 1 };
     await expect(encode({ a: shared, b: shared })).resolves.toBeDefined();
@@ -250,6 +263,50 @@ describe("transport", () => {
     await expect(client.request("fetchAttachment", ["a1"])).rejects.toThrow(
       /larger than/,
     );
+  });
+
+  it("gives up on an answer whose body stalls after its headers", async () => {
+    const client = createRpcClient({
+      url: "https://host.test/rpc",
+      secret: "s",
+      timeoutMs: 20,
+      fetch: async (_url, init) =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              init?.signal?.addEventListener("abort", () =>
+                controller.error(new DOMException("aborted", "AbortError")),
+              );
+            },
+          }),
+        ),
+    });
+
+    await expect(client.request("postMessage", [])).rejects.toMatchObject({
+      code: RpcErrorCode.TIMEOUT,
+    });
+  });
+
+  it("refuses a redirect rather than posting the signed body elsewhere", async () => {
+    const elsewhere = vi.fn(async () => Response.json({}));
+    const target = await startRealServer(elsewhere);
+    const redirect = await startRealServer(async () =>
+      Response.redirect(`${target.url}/rpc`, 307),
+    );
+    try {
+      const client = createRpcClient({
+        url: `${redirect.url}/rpc`,
+        secret: "s",
+      });
+
+      await expect(client.request("postMessage", [])).rejects.toMatchObject({
+        code: RpcErrorCode.UNAVAILABLE,
+      });
+      expect(elsewhere).not.toHaveBeenCalled();
+    } finally {
+      await redirect.close();
+      await target.close();
+    }
   });
 
   it("matches responses to their own request and never throws from notify", async () => {
