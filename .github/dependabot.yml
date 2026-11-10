@@ -5,6 +5,8 @@ updates:
     schedule:
       interval: weekly
     groups:
+      vitest:
+        patterns: [vitest, "@vitest/*"]
       development:
         dependency-type: development
         update-types: [minor, patch]
