@@ -63,7 +63,7 @@
     "@types/bun": "^1.4.2",
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
-    "@vitest/coverage-v8": "^4.0.0",
+    "@vitest/coverage-v8": "^5.1.0",
     "baileys": "^7.0.0-rc14",
     "chat": "^4.42.0",
     "chat-adapter-baileys": "^2.1.0",
