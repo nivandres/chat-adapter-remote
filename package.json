@@ -57,23 +57,23 @@
     "zod": "^3.0.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@chat-adapter/shared": "^4.42.0",
-    "@chat-adapter/state-memory": "^4.42.0",
-    "@chat-adapter/tests": "^4.42.0",
+    "@chat-adapter/shared": "^4.45.0",
+    "@chat-adapter/state-memory": "^4.45.0",
+    "@chat-adapter/tests": "^4.45.0",
     "@types/bun": "^1.4.2",
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
-    "@vitest/coverage-v8": "^4.0.0",
+    "@vitest/coverage-v8": "^5.1.0",
     "baileys": "^7.0.0-rc14",
-    "chat": "^4.42.0",
+    "chat": "^4.45.0",
     "chat-adapter-baileys": "^2.1.0",
     "oxlint": "^1.61.0",
     "prettier": "^3.8.3",
     "qrcode-terminal": "^0.12.0",
-    "tsup": "^8.3.0",
+    "tsup": "^9.0.0",
     "typescript": "^5.7.0",
     "vite-node": "^6.0.0",
-    "vitest": "^4.0.0"
+    "vitest": "^5.1.0"
   },
   "publishConfig": {
     "access": "public"
