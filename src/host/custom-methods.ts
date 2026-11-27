@@ -43,6 +43,7 @@ const ADAPTER_MEMBERS = new Set([
   "scheduleMessage",
   "startTyping",
   "stream",
+  "supportsReasoningChunks",
   "supportsTurnCancellation",
   "userName",
 ]);

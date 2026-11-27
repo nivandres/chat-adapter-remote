@@ -125,6 +125,7 @@ export class RemoteAdapter<
   lockScope?: LockScope;
   private concurrencyScope?: string;
   persistThreadHistory?: boolean;
+  supportsReasoningChunks?: boolean;
   supportsTurnCancellation?: boolean;
 
   private chat: ChatInstance | null = null;
@@ -219,6 +220,7 @@ export class RemoteAdapter<
     this.lockScope = handshake.lockScope;
     this.concurrencyScope = handshake.concurrencyScope;
     this.persistThreadHistory = handshake.persistThreadHistory;
+    this.supportsReasoningChunks = handshake.supportsReasoningChunks;
     this.supportsTurnCancellation = handshake.supportsTurnCancellation;
     this.idempotentCalls = handshake.idempotentCalls === true;
     this.applyCapabilities(handshake.capabilities);

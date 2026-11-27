@@ -63,6 +63,7 @@ export const HandshakeSchema = z
     lockScope: z.enum(["thread", "channel"]).optional(),
     concurrencyScope: z.string().optional(),
     persistThreadHistory: z.boolean().optional(),
+    supportsReasoningChunks: z.boolean().optional(),
     supportsTurnCancellation: z.boolean().optional(),
     capabilities: z.array(z.string()).optional(),
     customMethods: z.array(z.string()).optional(),

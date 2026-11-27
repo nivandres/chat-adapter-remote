@@ -260,6 +260,7 @@ describe("handshake", () => {
     const b = bridge({
       lockScope: "channel",
       persistThreadHistory: true,
+      supportsReasoningChunks: true,
       supportsTurnCancellation: true,
     });
     await handshake(b);
@@ -267,6 +268,7 @@ describe("handshake", () => {
     expect(b.remote.userName).toBe(b.adapter.userName);
     expect(b.remote.lockScope).toBe("channel");
     expect(b.remote.persistThreadHistory).toBe(true);
+    expect(b.remote.supportsReasoningChunks).toBe(true);
     expect(b.remote.supportsTurnCancellation).toBe(true);
   });
 

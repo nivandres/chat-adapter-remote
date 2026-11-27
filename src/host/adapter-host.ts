@@ -547,6 +547,7 @@ export class AdapterHost<TThreadId = unknown, TRawMessage = unknown> {
       concurrencyScope: adapter.getConcurrencyScope?.(),
       persistThreadHistory:
         adapter.persistThreadHistory ?? adapter.persistMessageHistory,
+      supportsReasoningChunks: adapter.supportsReasoningChunks,
       supportsTurnCancellation: adapter.supportsTurnCancellation,
       capabilities: this.capabilities,
       customMethods: this.customMethods,

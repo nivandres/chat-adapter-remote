@@ -50,6 +50,29 @@ describe("streaming", () => {
     expect(result).toEqual({ id: "streamed", threadId: THREAD, raw: {} });
   });
 
+  it("carries reasoning only to an adapter that shows it, as Chat does in-process", async () => {
+    const chunks: Array<string | StreamChunk> = [
+      { type: "reasoning", text: "thinking" },
+      { type: "markdown_text", text: "answer" },
+    ];
+    const received = async (supportsReasoningChunks: boolean) => {
+      const seen: Array<string | StreamChunk> = [];
+      const b = bridge({
+        supportsReasoningChunks,
+        stream: vi.fn(async (_threadId, stream) => {
+          for await (const chunk of stream) seen.push(chunk);
+          return { id: "streamed", threadId: THREAD, raw: {} };
+        }) as never,
+      });
+      await handshake(b);
+      await b.chat.thread(THREAD).post(source(chunks).iterable);
+      return seen;
+    };
+
+    expect(await received(true)).toEqual(chunks);
+    expect(await received(false)).toEqual([chunks[1]]);
+  });
+
   it("leaves the caller's iterable untouched when the adapter declines", async () => {
     const b = streamingBridge(async () => null);
     await handshake(b);

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.10
+
+Compatible with 0.8 on either side.
+
+### Added
+
+- `chat-adapter-remote/host` exports `FetchLike` and `Secret`, the types `serveAdapter`'s options take, so code that declares those options can name them.
+
+### Fixed
+
+- Chat SDK 4.45 keeps reasoning chunks from adapters that do not set `supportsReasoningChunks`, and the remote adapter never set it, so a stream lost its reasoning on the way to a host adapter that shows it. The host now reports the flag in the handshake and the consumer takes it on, as it does `supportsTurnCancellation`. Both sides need 0.8.10 for this.
+
 ## 0.8.9
 
 Hardening from an audit of delivery and the transport. Compatible with 0.8 on either side.

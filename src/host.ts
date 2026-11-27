@@ -37,4 +37,10 @@ export {
 } from "./host/delivery";
 export { PROTOCOL_VERSION } from "./rpc/methods";
 export { createReplayGuard, type ReplayGuard } from "./rpc/security";
-export type { HostEvent, RequestEvent, RequestHandler } from "./types";
+export type { Secret } from "./rpc/signing";
+export type {
+  FetchLike,
+  HostEvent,
+  RequestEvent,
+  RequestHandler,
+} from "./types";
